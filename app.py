@@ -19,9 +19,17 @@ import requests
 import streamlit as st
 from openai import OpenAI
 
-# --- Load .env first, then read every key with os.getenv ---
+# ---- Load .env FIRST, then every key via os.getenv ----
 from dotenv import load_dotenv
 load_dotenv()
+
+# Optional clipboard-paste component (Ctrl+V support)
+try:
+    from streamlit_paste_button import paste_image_button as pbutton
+    _HAS_PASTE_BTN = True
+except Exception:
+    pbutton = None
+    _HAS_PASTE_BTN = False
 
 log = logging.getLogger("ubti.lookup")
 logging.basicConfig(level=logging.INFO)
@@ -82,21 +90,18 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    def g(k: str, d: str = "") -> str:
-        return str(os.getenv(k, d) or d).strip()
-
     def i(k: str, d: int) -> int:
         try:
-            return max(1, int(g(k, str(d))))
-        except ValueError:
+            return max(1, int(os.getenv(k, str(d))))
+        except (TypeError, ValueError):
             return d
 
-    depth = g("TAVILY_SEARCH_DEPTH", "basic").lower()
+    depth = (os.getenv("TAVILY_SEARCH_DEPTH", "basic") or "basic").strip().lower()
     return Settings(
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "").strip(),
-        azure_key=os.getenv("AZURE_OPENAI_API_KEY", "").strip(),
-        deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1").strip(),
-        tavily_key=os.getenv("TAVILY_API_KEY", "").strip(),
+        azure_endpoint=(os.getenv("AZURE_OPENAI_ENDPOINT", "") or "").strip(),
+        azure_key=(os.getenv("AZURE_OPENAI_API_KEY", "") or "").strip(),
+        deployment=(os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1") or "gpt-4.1").strip(),
+        tavily_key=(os.getenv("TAVILY_API_KEY", "") or "").strip(),
         tavily_depth=depth if depth in ("basic", "advanced") else "basic",
         websearch_budget=i("WEBSEARCH_BUDGET_SECONDS", 30),
         io_workers=i("IO_WORKERS", 12),
@@ -218,46 +223,71 @@ def parse_contacts(raw: str, company_hint: str = "", include_sender: bool = Fals
     return out
 
 
-IMAGE_EXTRACT_PROMPT = """You are an assistant that extracts contact information from images of emails, meeting invites,
-business cards, chat screenshots, or any document that contains people's names and email addresses.
+# ── Azure vision: extract contacts from an image ──────────────────────────────
 
-Extract ALL people mentioned with their:
-- full_name: the person's display name
-- email: their email address (if visible)
-- company_hint: the company name if you can determine it from the domain, signature, or context
+IMAGE_EXTRACT_PROMPT = """You extract contact information from images of emails, meeting invites,
+business cards, chat screenshots, or any document containing people's names and email addresses.
 
-Return a JSON object with this exact shape:
+Return a JSON object with this EXACT shape:
 {
   "contacts": [
-    {"full_name": "...", "email": "...", "company_hint": "..."}
+    {"full_name": "Jane Doe", "email": "jane@acme.com", "company_hint": "Acme"}
   ],
-  "company_context": "any overall company or meeting context you can extract",
-  "raw_text": "the full text you can read from the image, preserving structure"
+  "company_context": "any overall company or meeting context",
+  "raw_text": "all readable text, preserving structure"
 }
 
 Rules:
-- Extract EVERY person, including From/sender
-- If you can see email addresses, include them exactly as shown
-- If you can only see names without emails, still include them with email as ""
-- For company_hint, derive from email domain or any company names visible
-- In raw_text, include everything you can read — headers, subject lines, signatures, body text
-- Be thorough — do not skip anyone
-- Return ONLY the JSON object, no markdown or explanation"""
+- Extract EVERY person (including the sender/From)
+- Copy email addresses exactly as shown; if only a name is visible, set email to ""
+- Derive company_hint from the email domain, signature, or visible company names
+- raw_text must contain everything readable — headers, subject, body, signatures
+- Return ONLY the JSON object — no markdown, no explanation"""
+
+
+def azure_client(s: Settings, timeout: int, retries: int) -> OpenAI:
+    m = re.match(r"(https?://[^/\s]+)", s.azure_endpoint.strip())
+    base = (m.group(1) if m else s.azure_endpoint.rstrip("/")) + "/openai/v1/"
+    return OpenAI(base_url=base, api_key=s.azure_key, timeout=timeout, max_retries=retries)
+
+
+def extract_json(text: str) -> dict:
+    text = (text or "").strip()
+    try:
+        val = json.loads(text)
+        return val if isinstance(val, dict) else {"_parse_error": text[:300]}
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        try:
+            val = json.loads(m.group(0))
+            if isinstance(val, dict):
+                return val
+        except Exception:
+            pass
+    return {"_parse_error": text[:300]}
 
 
 def extract_contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png") -> dict:
+    """Send an image to Azure OpenAI vision and get back structured contact JSON."""
+    if not image_bytes:
+        return {"contacts": [], "company_context": "", "raw_text": ""}
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     client = azure_client(s, s.synth_timeout + 30, retries=2)
     resp = client.chat.completions.create(
         model=s.deployment,
         messages=[
-            {"role": "system", "content": "You extract contact information from images. Return only valid JSON."},
+            {"role": "system",
+             "content": "You extract contact information from images. Return only valid JSON."},
             {"role": "user", "content": [
                 {"type": "text", "text": IMAGE_EXTRACT_PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}},
             ]},
         ],
         response_format={"type": "json_object"},
+        max_tokens=2000,
     )
     return extract_json(resp.choices[0].message.content)
 
@@ -282,18 +312,15 @@ def contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png"
                 name_guess=name or guess_name_from_local(local), company_hint=c_hint,
             ))
 
+    # Regex sweep on the OCR text as a safety net
     if raw_text:
         contacts.extend(_chunks_to_contacts(raw_text, hint, seen))
-
     return contacts, hint
 
 
-SMART_PARSE_PROMPT = """You are an assistant that extracts contact information from messy, unstructured text.
+# ── Smart parsing for messy / unstructured text ───────────────────────────────
 
-Extract ALL people you can identify with their:
-- full_name: the person's name
-- email: their email address (if present)
-- company_hint: company name if you can determine it
+SMART_PARSE_PROMPT = """You extract contact information from messy, unstructured text.
 
 Return a JSON object:
 {
@@ -305,11 +332,27 @@ Return a JSON object:
 
 Rules:
 - Include EVERY person mentioned
-- If names appear without emails, include them (email: "")
+- If a name appears without an email, include it with email: ""
 - Look for company names ANYWHERE in the text
 - Handle Indian name patterns: initials like "Ganesh R", "Venkatesh M"
-- An email domain like @ak.com.sa means the company might be "Al Abdul Karim" or similar
+- A domain like @ak.com.sa may indicate "Al Abdul Karim" — use context
 - Return ONLY the JSON, no markdown"""
+
+
+def llm_json(s: Settings, system: str, user: str) -> dict:
+    client = azure_client(s, s.synth_timeout, retries=2)
+    data: dict = {}
+    for _ in range(2):
+        resp = client.chat.completions.create(
+            model=s.deployment,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+        )
+        data = extract_json(resp.choices[0].message.content)
+        if "_parse_error" not in data:
+            return data
+        user += "\n\nReturn ONLY one valid JSON object."
+    return data
 
 
 def smart_parse(raw: str, s: Settings, company_hint: str = "",
@@ -318,24 +361,14 @@ def smart_parse(raw: str, s: Settings, company_hint: str = "",
     if fast:
         return fast, company_hint
 
-    client = azure_client(s, s.synth_timeout, retries=2)
     prompt = f"Extract contacts from this text:\n\n{raw}"
     if company_hint:
         prompt += f"\n\nAdditional context from the user: {company_hint}"
+    data = llm_json(s, SMART_PARSE_PROMPT, prompt)
 
-    resp = client.chat.completions.create(
-        model=s.deployment,
-        messages=[
-            {"role": "system", "content": SMART_PARSE_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-    )
-    data = extract_json(resp.choices[0].message.content)
     contacts: list[Contact] = []
     seen: set[str] = set()
     llm_hint = str(data.get("company_context") or company_hint).strip()
-
     for entry in data.get("contacts") or []:
         email = str(entry.get("email") or "").strip().lower()
         name = str(entry.get("full_name") or "").strip()
@@ -381,46 +414,6 @@ def tavily_search(s: Settings, query: str, include_domains: tuple[str, ...] | No
            for x in r.json().get("results", []) if x.get("url")]
     SEARCH_CACHE.set(key, out)
     return out
-
-
-def azure_client(s: Settings, timeout: int, retries: int) -> OpenAI:
-    m = re.match(r"(https?://[^/\s]+)", s.azure_endpoint.strip())
-    base = (m.group(1) if m else s.azure_endpoint.rstrip("/")) + "/openai/v1/"
-    return OpenAI(base_url=base, api_key=s.azure_key, timeout=timeout, max_retries=retries)
-
-
-def extract_json(text: str) -> dict:
-    text = (text or "").strip()
-    try:
-        val = json.loads(text)
-        return val if isinstance(val, dict) else {"_parse_error": text[:300]}
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", text, re.S)
-    if m:
-        try:
-            val = json.loads(m.group(0))
-            if isinstance(val, dict):
-                return val
-        except Exception:
-            pass
-    return {"_parse_error": text[:300]}
-
-
-def llm_json(s: Settings, system: str, user: str) -> dict:
-    client = azure_client(s, s.synth_timeout, retries=2)
-    data: dict = {}
-    for _ in range(2):
-        resp = client.chat.completions.create(
-            model=s.deployment,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format={"type": "json_object"},
-        )
-        data = extract_json(resp.choices[0].message.content)
-        if "_parse_error" not in data:
-            return data
-        user += "\n\nReturn ONLY one valid JSON object."
-    return data
 
 
 def azure_web_search(s: Settings, prompt: str) -> tuple[dict, list[str]]:
@@ -625,7 +618,7 @@ def _ws_result(f: Future | None, deadline: float, notes: list[str]) -> tuple[dic
         return {}, []
     wait([f], timeout=max(0.0, deadline - time.time()))
     if not f.done():
-        notes.append("Azure web search was still running; results were built from the faster sources.")
+        notes.append("Azure web search was still running; results built from faster sources.")
         return {}, []
     val, err = f.result()
     if err or not val:
@@ -820,7 +813,7 @@ def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = Fa
 
 
 # ======================================================================================
-# SECTION 7 — Exports (fixed)
+# SECTION 7 — Exports
 # ======================================================================================
 
 def _best_source(item: dict) -> str:
@@ -885,7 +878,7 @@ def to_docx(people: list[dict], companies: dict[str, dict], elapsed: float = 0) 
     t = doc.add_heading("Contact Intelligence Report", level=0)
     for run in t.runs:
         run.font.size = Pt(20)
-        run.font.color.rgb = RGBColor(0x1F, 0x4F, 0xD8)
+        run.font.color.rgb = RGBColor(0x03, 0x69, 0xA1)
 
     n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
     doc.add_paragraph(
@@ -933,56 +926,61 @@ def to_docx(people: list[dict], companies: dict[str, dict], elapsed: float = 0) 
 
 
 # ======================================================================================
-# SECTION 8 — UI
+# SECTION 8 — Crystal Blue UI
 # ======================================================================================
 
-def _paste_component():
-    """
-    In-UI clipboard paste catcher for screenshots.
-    Streamlit >= 1.40 supports pasting into st.chat_input, but this component
-    provides an explicit 'paste here' area that also works on older versions.
-    """
-    import streamlit.components.v1 as components
-    html = """
-    <div id="paste-box" style="border:2px dashed #94a3b8;border-radius:10px;padding:18px;
-         text-align:center;color:#64748b;font-family:sans-serif;font-size:14px;background:#f8fafc;">
-      Click here, then press <b>Ctrl+V</b> to paste a screenshot.<br>
-      <span style="font-size:12px">(or drag &amp; drop an image anywhere on the page)</span>
-      <div id="preview" style="margin-top:10px"></div>
-    </div>
-    <script>
-    const box = document.getElementById('paste-box');
-    const prev = document.getElementById('preview');
-    let dataUrl = null;
+CRYSTAL = "#0EA5E9"
+DEEP = "#0369A1"
+LIGHT = "#F0F9FF"
+MUTED = "#64748B"
 
-    function handleImage(blob) {
-      const reader = new FileReader();
-      reader.onload = e => {
-        dataUrl = e.target.result;
-        prev.innerHTML = '<img src="' + dataUrl + '" style="max-height:160px;border-radius:6px"/>';
-        // Put into a hidden input so Streamlit can't see it directly — we expose via a
-        // global that a tiny companion JS reads on rerun is not available, so instead
-        // we store in sessionStorage and surface via a visible textarea the user can copy.
-        // Simpler & robust: show it and let Streamlit's file uploader handle the actual file.
-      };
-      reader.readAsDataURL(blob);
-    }
 
-    box.addEventListener('paste', e => {
-      const items = (e.clipboardData || window.clipboardData).items;
-      for (const it of items) {
-        if (it.type.indexOf('image') === 0) { handleImage(it.getAsFile()); e.preventDefault(); }
-      }
-    });
-
-    box.addEventListener('dragover', e => e.preventDefault());
-    box.addEventListener('drop', e => {
-      e.preventDefault();
-      for (const f of e.dataTransfer.files) if (f.type.indexOf('image') === 0) handleImage(f);
-    });
-    </script>
-    """
-    components.html(html, height=170)
+def _inject_css():
+    st.markdown(f"""
+    <style>
+      .stApp {{ background: linear-gradient(135deg, {LIGHT} 0%, #FFFFFF 100%); }}
+      section[data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, #E0F2FE 0%, {LIGHT} 100%);
+        border-right: 1px solid #BAE6FD;
+      }}
+      h1, h2, h3 {{ color: {DEEP} !important; font-weight: 600 !important; }}
+      .stButton > button[kind="primary"] {{
+        background: linear-gradient(135deg, {CRYSTAL} 0%, {DEEP} 100%);
+        color: white; border: none; border-radius: 10px;
+        padding: 0.6rem 1.5rem; font-weight: 600;
+        box-shadow: 0 4px 14px rgba(14,165,233,0.35);
+        transition: all .2s ease;
+      }}
+      .stButton > button[kind="primary"]:hover {{
+        transform: translateY(-1px);
+        box-shadow: 0 6px 20px rgba(14,165,233,0.5);
+      }}
+      .stButton > button {{
+        border-radius: 8px; border: 1px solid #BAE6FD; color: {DEEP};
+      }}
+      .stTextInput > div > div > input,
+      .stTextArea > div > div > textarea {{
+        border-radius: 10px; border: 1px solid #BAE6FD;
+      }}
+      .stTextInput > div > div > input:focus,
+      .stTextArea > div > div > textarea:focus {{
+        border-color: {CRYSTAL};
+        box-shadow: 0 0 0 2px rgba(14,165,233,0.2);
+      }}
+      .stDataFrame {{ border-radius: 10px; overflow: hidden; border: 1px solid #BAE6FD; }}
+      .stProgress > div > div > div > div {{
+        background: linear-gradient(90deg, {CRYSTAL}, {DEEP});
+      }}
+      hr {{ border-color: #BAE6FD; }}
+      .hero {{
+        background: linear-gradient(135deg, {CRYSTAL} 0%, {DEEP} 100%);
+        color: white; padding: 1.4rem 1.6rem; border-radius: 14px;
+        margin-bottom: 1rem; box-shadow: 0 8px 24px rgba(14,165,233,0.25);
+      }}
+      .hero h1 {{ color: white !important; margin: 0; font-size: 1.8rem; }}
+      .hero p {{ color: #E0F2FE; margin: .25rem 0 0 0; }}
+    </style>
+    """, unsafe_allow_html=True)
 
 
 def _render_people_table(people: list[dict]):
@@ -992,100 +990,143 @@ def _render_people_table(people: list[dict]):
         rows.append({
             "S.No": idx,
             "Name": p.get("full_name") or c["name_guess"],
-            "Title": p.get("current_title", "") or "—",
-            "Department": p.get("department", "") or "—",
-            "AI Relevance": p.get("ai_relevance", "") or "—",
-            "Notes": p.get("notes", "") or "—",
+            "Title": p.get("current_title") or "—",
+            "Department": p.get("department") or "—",
+            "AI Relevance": p.get("ai_relevance") or "—",
+            "Notes": p.get("notes") or "—",
             "Confidence": p.get("confidence", ""),
             "Source": _best_source(x) or "—",
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+def _image_bytes(img) -> tuple[bytes, str]:
+    """Normalise a Streamlit UploadedFile, PIL Image, or raw bytes to (bytes, mime)."""
+    if isinstance(img, (bytes, bytearray)):
+        return bytes(img), "image/png"
+    # PIL image
+    if hasattr(img, "save") and not hasattr(img, "read"):
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue(), "image/png"
+    # UploadedFile
+    try:
+        data = img.getvalue()
+    except Exception:
+        img.seek(0)
+        data = img.read()
+    mime = getattr(img, "type", None) or "image/png"
+    return data, mime
+
+
 def main():
-    st.title("◆ UBTI Contact Intelligence")
-    st.caption("Extract contacts from text or screenshots, enrich them with AI web research, and export clean reports.")
+    _inject_css()
 
-    # ---- Sidebar: config + health ----
+    # ---- Sidebar ----
     with st.sidebar:
-        st.header("Configuration")
+        st.markdown("### ◆ UBTI")
+        st.caption("Contact Intelligence Engine")
         if S.ready:
-            st.success("APIs configured")
+            st.success("✓ APIs configured")
         else:
-            st.error("Missing API keys")
-            missing = []
+            st.error("✗ Missing API keys")
+            miss = []
             if not S.has_azure:
-                missing.append("AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_DEPLOYMENT")
+                miss.append("Azure OpenAI keys")
             if not S.has_tavily:
-                missing.append("TAVILY_API_KEY")
-            st.code("\n".join(missing), language="text")
-        st.caption(f"Engine: **{S.engine_label}**")
-        st.caption(f"Tavily depth: **{S.tavily_depth}** · IO workers: **{S.io_workers}**")
+                miss.append("Tavily key")
+            st.code("\n".join(miss), language="text")
 
-        with st.expander("Advanced"):
-            include_sender = st.checkbox("Include email sender (From)", value=False,
-                                         help="When pasting a full email header block, include the From address.")
-            force_refresh = st.checkbox("Bypass cache (force re-research)", value=False)
+        st.divider()
+        st.caption(f"Engine: **{S.engine_label}**")
+        st.caption(f"Depth: **{S.tavily_depth}** · Workers: **{S.io_workers}**")
+
+        with st.expander("Advanced", expanded=False):
+            include_sender = st.checkbox("Include email sender (From)", value=False)
+            force_refresh = st.checkbox("Bypass cache", value=False)
 
         if st.button("Clear caches", use_container_width=True):
-            try:
-                SEARCH_CACHE._d.clear()
-                PROFILE_CACHE._d.clear()
-                st.session_state.pop("result", None)
-                st.success("Caches cleared")
-            except Exception:
-                pass
+            SEARCH_CACHE._d.clear()
+            PROFILE_CACHE._d.clear()
+            st.session_state.pop("result", None)
+            st.success("Caches cleared")
+
+    # ---- Hero ----
+    st.markdown("""
+    <div class="hero">
+      <h1>◆ Contact Intelligence</h1>
+      <p>Extract contacts from text or screenshots · Enrich with AI · Export clean reports</p>
+    </div>
+    """, unsafe_allow_html=True)
 
     # ---- Input area ----
-    st.subheader("1 · Add contacts")
-    st.markdown(
-        "Paste an email header, a list of `Name <email>`, or drop a **screenshot** "
-        "(email, meeting invite, business card, chat). "
-        "On Streamlit ≥ 1.40 you can also press **Ctrl+V** directly in the chat box below."
-    )
+    col_left, col_right = st.columns([1, 1], gap="large")
 
-    # Text paste
-    raw_text = st.text_area(
-        "Paste text",
-        height=180,
-        placeholder="e.g.\nGanesh R <ganesh.r@ak.com.sa>\nFrom: Jane Doe <jane@acme.com>\nTo: ...",
-        key="raw_text",
-    )
+    with col_left:
+        st.subheader("📝 Paste text")
+        raw_text = st.text_area(
+            "Email headers, contact lists, or any messy text",
+            height=200,
+            placeholder="Ganesh R <ganesh.r@ak.com.sa>\nFrom: Jane Doe <jane@acme.com>\nTo: ...",
+            key="raw_text",
+            label_visibility="collapsed",
+        )
+        context_hint = st.text_input(
+            "Company / context hint (optional)",
+            placeholder="e.g. Al Abdul Karim, Saudi Arabia",
+            key="context_hint",
+        )
 
-    # Image input — chat_input natively supports clipboard paste on modern Streamlit
-    st.caption("Screenshot: paste with **Ctrl+V** in the box below, or upload a file.")
-    chat_images = []
-    try:
-        chat = st.chat_input("Paste a screenshot here (Ctrl+V)…", accept_file=True,
-                             file_type=["png", "jpg", "jpeg", "webp"], key="img_chat")
-        if chat and getattr(chat, "files", None):
-            chat_images = chat.files
-    except TypeError:
-        # Older Streamlit: no accept_file support
-        st.info("Clipboard image paste needs Streamlit ≥ 1.40. Use the uploader below instead.")
+    with col_right:
+        st.subheader("📋 Paste screenshot")
+        st.caption("Click **Paste from Clipboard**, then press **Ctrl+V** — or upload a file below.")
 
-    uploaded = st.file_uploader("…or upload image(s)", type=["png", "jpg", "jpeg", "webp"],
-                                accept_multiple_files=True)
+        pasted_image = None
+        if _HAS_PASTE_BTN:
+            res = pbutton(
+                "📋 Paste from Clipboard",
+                text_color="#ffffff",
+                background_color=CRYSTAL,
+                hover_background_color=DEEP,
+                errors="ignore",
+                key="paste_btn",
+            )
+            if res and res.image_data is not None:
+                pasted_image = res.image_data
+                st.image(pasted_image, caption="Pasted from clipboard", width=260)
+        else:
+            st.warning("Install `streamlit-paste-button` to enable Ctrl+V paste.")
 
-    if chat_images or uploaded:
-        st.image([f for f in (chat_images or uploaded)],
-                 caption=["pasted" if chat_images else "uploaded"] * len(chat_images or uploaded),
-                 width=220)
+        uploaded = st.file_uploader(
+            "…or upload image(s)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+        )
+        if uploaded:
+            cols = st.columns(min(len(uploaded), 3))
+            for i, u in enumerate(uploaded):
+                cols[i % 3].image(u, width=120)
 
-    context_hint = st.text_input("Company / context hint (optional)",
-                                 placeholder="e.g. Al Abdul Karim, Saudi Arabia")
+    st.divider()
 
     # ---- Run ----
-    st.subheader("2 · Research")
-    can_run = S.ready and (bool(raw_text.strip()) or bool(chat_images) or bool(uploaded))
-    if st.button("▶ Start research", type="primary", disabled=not can_run, use_container_width=True):
+    can_run = S.ready and (bool(raw_text.strip()) or pasted_image is not None or bool(uploaded))
+    c_btn, c_info = st.columns([1, 3], gap="large")
+    with c_btn:
+        run_clicked = st.button("▶ Start Research", type="primary",
+                                disabled=not can_run, use_container_width=True)
+    with c_info:
         if not S.ready:
-            st.error("Configure API keys in .env first.")
-            return
+            st.warning("Configure API keys in `.env` first")
+        elif not can_run:
+            st.info("Add text or a screenshot to begin")
+
+    if run_clicked:
         all_contacts: list[Contact] = []
         seen: set[str] = set()
 
-        # Parse text
+        # Text
         if raw_text.strip():
             with st.spinner("Parsing text…"):
                 tc, _ = smart_parse(raw_text, S, context_hint, include_sender)
@@ -1094,14 +1135,20 @@ def main():
                         seen.add(c.email)
                         all_contacts.append(c)
 
-        # Parse images
-        for img in (chat_images or uploaded or []):
-            try:
-                data = img.read() if hasattr(img, "read") else img.getvalue()
-            except Exception:
-                data = img.getvalue() if hasattr(img, "getvalue") else b""
-            mime = getattr(img, "type", None) or "image/png"
-            with st.spinner(f"Reading image ({getattr(img, 'name', 'pasted')})…"):
+        # Pasted image
+        if pasted_image is not None:
+            with st.spinner("Reading pasted screenshot with Azure vision…"):
+                data, mime = _image_bytes(pasted_image)
+                ic, _ = contacts_from_image(data, S, mime, include_sender)
+                for c in ic:
+                    if c.email not in seen:
+                        seen.add(c.email)
+                        all_contacts.append(c)
+
+        # Uploaded images
+        for img in uploaded or []:
+            with st.spinner(f"Reading image ({getattr(img, 'name', 'upload')}) with Azure vision…"):
+                data, mime = _image_bytes(img)
                 ic, _ = contacts_from_image(data, S, mime, include_sender)
                 for c in ic:
                     if c.email not in seen:
@@ -1110,36 +1157,29 @@ def main():
 
         all_contacts = all_contacts[:S.max_contacts]
         if not all_contacts:
-            st.warning("No contacts with valid email addresses were found. "
-                       "Names without emails cannot be researched.")
-            return
-
-        st.info(f"Researching **{len(all_contacts)}** contact(s) across "
-                f"**{len({c.domain for c in all_contacts})}** domain(s)…")
-
-        progress = st.progress(0.0, text="Starting…")
-        result = None
-        for event in run_lookup(all_contacts, context_hint, S, force=force_refresh):
-            if event["type"] == "progress":
-                pct = event["done"] / max(event["total"], 1)
-                progress.progress(pct, text=event["message"])
-            elif event["type"] == "result":
-                result = event["data"]
-        progress.empty()
-
-        if result:
-            st.session_state["result"] = result
-            st.success(f"Done in {result['elapsed']}s · engine: {result['engine']}")
+            st.warning("No contacts with valid email addresses were found.")
+        else:
+            st.info(f"Researching **{len(all_contacts)}** contact(s)…")
+            progress = st.progress(0.0, text="Starting…")
+            result = None
+            for event in run_lookup(all_contacts, context_hint, S, force=force_refresh):
+                if event["type"] == "progress":
+                    progress.progress(event["done"] / max(event["total"], 1), text=event["message"])
+                elif event["type"] == "result":
+                    result = event["data"]
+            progress.empty()
+            if result:
+                st.session_state["result"] = result
+                st.success(f"Done in {result['elapsed']}s · {result['engine']}")
 
     # ---- Results ----
     result = st.session_state.get("result")
     if not result:
         return
 
-    st.subheader("3 · Results")
-    people = result["people"]
-    companies = result["companies"]
-
+    st.divider()
+    st.subheader("📊 Results")
+    people, companies = result["people"], result["companies"]
     _render_people_table(people)
 
     with st.expander("Company profiles", expanded=False):
@@ -1153,7 +1193,7 @@ def main():
             for n in result["notes"]:
                 st.write(f"- {n}")
 
-    st.subheader("4 · Export")
+    st.subheader("📥 Export")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.download_button("⬇ CSV", data=to_csv(people, companies),
