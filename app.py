@@ -1373,6 +1373,80 @@ def process(text: str, files: list, hint: str, include_sender: bool, force: bool
     return {"role": "assistant", "text": summary, "result": result, "files": build_files(result)}
 
 
+# ======================================================================================
+# SECTION 9b — Follow-up conversation (streamed answers grounded in earlier results)
+# ======================================================================================
+
+FOLLOWUP_SYSTEM = (
+    "You are a B2B research assistant inside a contact-intelligence app. The user is chatting about "
+    "contacts that were researched earlier in this conversation. Answer using the CONTEXT (earlier research "
+    "results) and the FRESH WEB EVIDENCE. Never invent facts, titles, employers or URLs; if something is not "
+    "supported by the evidence, say it was not found. Cite sources as markdown links [site](url). "
+    "Be concise and well structured: short paragraphs or bullet points, bold key facts. "
+    "When asked for more details about a person, cover: current role, company, location, career history, "
+    "expertise/skills, public activity, and a confidence note. Reply in the user's language."
+)
+
+
+def _chat_context(history: list[dict]) -> tuple[str, list[dict]]:
+    """Compact JSON of earlier results, plus the person the question most likely refers to."""
+    people, companies = [], {}
+    for m in history:
+        res = m.get("result")
+        if not res:
+            continue
+        companies.update(res.get("companies") or {})
+        for x in res["people"]:
+            p = x["profile"]
+            people.append({
+                "name": p.get("full_name") or x["contact"]["name_guess"], "email": x["contact"]["email"],
+                **{k: p.get(k) for k in ("current_title", "current_company", "department", "location", "summary",
+                                         "previous_roles", "notes", "confidence", "linkedin_url", "sources")}})
+    ctx = json.dumps({"people": people, "companies": list(companies.values())}, ensure_ascii=False)[:14000]
+    return ctx, people
+
+
+def _find_target(question: str, people: list[dict]) -> dict | None:
+    q = set(re.findall(r"[a-z0-9]+", question.lower()))
+    best, best_n = None, 0
+    for p in people:
+        toks = {t for t in re.findall(r"[a-z0-9]+", f"{p['name']} {p['email'].split('@')[0]}".lower()) if len(t) > 2}
+        n = len(toks & q)
+        if n > best_n:
+            best, best_n = p, n
+    return best
+
+
+def build_followup_messages(question: str, history: list[dict], s: Settings) -> list[dict]:
+    ctx, people = _chat_context(history)
+    target = _find_target(question, people)
+    if target:
+        who = f'{target["name"]} {target.get("current_company") or ""}'.strip()
+        queries = [(f'"{target["name"]}" {target.get("current_company") or ""}', None),
+                   (f"{who} experience career background", None),
+                   (f'"{target["name"]}" {target.get("current_company") or ""}', tuple(PEOPLE_SITES))]
+    else:
+        queries = [(question, None), (f"{question} {people[0].get('current_company') or ''}".strip(), None)] \
+            if people else [(question, None)]
+    ev: list[dict] = []
+    if s.has_tavily:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = [pool.submit(_safe, tavily_search, s, q, d, 6) for q, d in queries]
+            ev, _ = _collect(futs, s.search_timeout * 2)
+        ev = _rank(ev, [t for t in re.findall(r"\w+", question + " " + (target["name"] if target else ""))], keep=12)
+    turns = [{"role": m["role"], "content": m["text"]} for m in history[-6:] if m.get("text")]
+    user = (f"CONTEXT (earlier research results):\n{ctx or 'none'}\n\n"
+            f"FRESH WEB EVIDENCE:\n{json.dumps(ev, ensure_ascii=False)}\n\nQUESTION: {question}")
+    return [{"role": "system", "content": FOLLOWUP_SYSTEM}, *turns, {"role": "user", "content": user}]
+
+
+def stream_chat(messages: list[dict], s: Settings) -> Iterator[str]:
+    client = azure_client(s, s.synth_timeout * 2, retries=2)
+    for chunk in client.chat.completions.create(model=s.deployment, messages=messages, stream=True):
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
 def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     _init_state()
@@ -1427,13 +1501,13 @@ def main() -> None:
     # ---------------- Input ----------------
     fallback_files: list = []
     try:
-        val = st.chat_input("Paste contacts or a screenshot (Ctrl+V), or attach images…",
+        val = st.chat_input("Paste contacts or a screenshot, or ask a follow-up question…",
                             accept_file="multiple", file_type=["png", "jpg", "jpeg", "webp"])
     except TypeError:  # Streamlit < 1.43
         with st.sidebar:
             fallback_files = st.file_uploader("Screenshots", type=["png", "jpg", "jpeg", "webp"],
                                               accept_multiple_files=True) or []
-        val = st.chat_input("Paste contacts here…")
+        val = st.chat_input("Paste contacts or ask a follow-up…")
 
     text, files = "", list(fallback_files)
     if isinstance(val, str):
@@ -1449,17 +1523,31 @@ def main() -> None:
         st.error("Configure API keys in .env first.")
         return
 
+    is_lookup = bool(files) or bool(EMAIL_RE.search(text))
+    history = list(msgs)
     images = [f.getvalue() for f in files]
-    msgs.append({"role": "user", "text": f"```\n{text.strip()}\n```" if text.strip() else "", "images": images})
+    body = text.strip()
+    msgs.append({"role": "user", "images": images,
+                 "text": f"```\n{body}\n```" if (body and is_lookup) else body})
     if chat["title"] == "New chat":
         m = EMAIL_RE.search(text)
-        chat["title"] = (m.group(0) if m else text.strip().splitlines()[0][:30]) if text.strip() else "Screenshot lookup"
+        chat["title"] = (m.group(0) if m else body.splitlines()[0][:30]) if body else "Screenshot lookup"
     render_message(msgs[-1], "tmp")
     with st.chat_message("assistant", avatar=":material/hub:"):
-        reply = process(text, files, hint, include_sender, force)
+        if is_lookup:
+            reply = process(text, files, hint, include_sender, force)
+        else:
+            try:
+                with st.spinner("Researching…"):
+                    messages = build_followup_messages(body, history, S)
+                answer = st.write_stream(stream_chat(messages, S))
+            except Exception as e:
+                log.warning("follow-up failed: %s", e)
+                answer = "Sorry, I couldn't complete that request. Please try again."
+                st.markdown(answer)
+            reply = {"role": "assistant", "text": answer}
     msgs.append(reply)
     st.rerun()
-
 
 if __name__ == "__main__":
     main()
