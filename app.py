@@ -1146,14 +1146,17 @@ header[data-testid="stHeader"]{background:transparent;}
 /* ---------- sidebar: deep UBTI indigo ---------- */
 [data-testid="stSidebar"]{background:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(165deg,#326898 0%,#286598 50%,#1C486E 100%);background-size:34px 34px,34px 34px,auto;border-right:0;}
 [data-testid="stSidebarCollapseButton"] svg,[data-testid="stSidebarCollapsedControl"] svg{color:#DCEAF6;}
-.logo-card{display:block;background:#fff;border-radius:14px;padding:12px 16px;margin:.4rem 0 1.6rem 0;box-shadow:0 8px 22px rgba(10,35,66,.28);}
+[data-testid="stSidebarHeader"]{height:0;min-height:0;padding:0;overflow:visible;}
+[data-testid="stSidebarHeader"] [data-testid="stSidebarCollapseButton"]{position:absolute;top:.5rem;right:.5rem;z-index:5;}
+[data-testid="stSidebarUserContent"]{padding-top:1.1rem!important;}
+.logo-card{display:block;background:#fff;border-radius:14px;padding:12px 16px;margin:0 0 1.3rem 0;box-shadow:0 8px 22px rgba(10,35,66,.28);}
 .logo{display:block;width:100%;}
 [data-testid="stSidebar"] .stButton>button{background:transparent;border:1px solid transparent;color:#EAF3FB;
   justify-content:flex-start;text-align:left;border-radius:10px;padding:.55rem .8rem;font-weight:500;font-size:.9rem;box-shadow:none;}
 [data-testid="stSidebar"] .stButton>button:hover{background:rgba(255,255,255,.10);color:#fff;border-color:transparent;}
 [data-testid="stSidebar"] .stButton>button[kind="primary"]{background:rgba(255,255,255,.16);color:#fff;border-color:rgba(255,255,255,.30);}
-.st-key-new_chat button{background:#fff!important;color:#245E8F!important;font-weight:600!important;justify-content:center!important;border:0!important;box-shadow:0 6px 18px rgba(10,35,66,.25)!important;}
-.st-key-new_chat button:hover{background:#EAF3FB!important;}
+.st-key-new_chat button{background:rgba(255,255,255,.12)!important;color:#fff!important;font-weight:600!important;justify-content:center!important;border:1px solid rgba(255,255,255,.30)!important;box-shadow:none!important;}
+.st-key-new_chat button:hover{background:rgba(255,255,255,.22)!important;border-color:rgba(255,255,255,.5)!important;}
 .side-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:#BFD6EC;font-weight:600;margin:1.6rem 0 .4rem .4rem;}
 .side-empty{color:#BFD6EC;font-size:.84rem;padding:.2rem .5rem;}
 .side-foot{position:fixed;bottom:16px;left:22px;font-size:.78rem;}
