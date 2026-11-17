@@ -6,3 +6,5 @@ python-dotenv
 openpyxl
 python-docx
 fpdf2
+streamlit-paste-button
+Pillow
