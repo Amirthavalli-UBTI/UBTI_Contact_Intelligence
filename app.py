@@ -20,8 +20,11 @@ import streamlit as st
 from openai import OpenAI
 
 # ---- Load .env FIRST, then every key via os.getenv ----
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # Optional clipboard-paste component (Ctrl+V support)
 try:
@@ -35,14 +38,14 @@ log = logging.getLogger("ubti.lookup")
 logging.basicConfig(level=logging.INFO)
 
 st.set_page_config(
-    page_title="Unlimited Innovations | Contact Intelligence",
-    page_icon="◆",
+    page_title="Unlimited Innovations — Contact Intelligence",
+    page_icon="🌐",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ======================================================================================
-# SECTION 1 — Constants & settings (Unchanged logic, hidden from UI)
+# SECTION 1 — Constants & settings
 # ======================================================================================
 
 FREE_MAIL_DOMAINS = {
@@ -153,7 +156,7 @@ def _h(*parts) -> str:
 
 
 # ======================================================================================
-# SECTION 2 — Contact parsing (Unchanged logic)
+# SECTION 2 — Contact parsing
 # ======================================================================================
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -382,7 +385,7 @@ def smart_parse(raw: str, s: Settings, company_hint: str = "",
 
 
 # ======================================================================================
-# SECTION 3 — Search backends (Unchanged logic)
+# SECTION 3 — Search backends
 # ======================================================================================
 
 def tavily_search(s: Settings, query: str, include_domains: tuple[str, ...] | None = None,
@@ -585,7 +588,7 @@ def _incomplete(p: dict) -> bool:
 
 
 # ======================================================================================
-# SECTION 6 — Research jobs + orchestrator (Unchanged logic)
+# SECTION 6 — Research jobs + orchestrator
 # ======================================================================================
 
 def _safe(fn, *a, **kw):
@@ -770,7 +773,7 @@ def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = Fa
         label.update({f: ("person", e) for e, f in person_f.items()})
         names = {c.email: c.name_guess for c in contacts}
         total, done = len(label), 0
-        yield {"type": "progress", "done": 0, "total": total, "message": "Searching the web in parallel…"}
+        yield {"type": "progress", "done": 0, "total": total, "message": "Searching the web…"}
         for f in as_completed(label):
             done += 1
             kind, ident = label[f]
@@ -924,80 +927,97 @@ def to_docx(people: list[dict], companies: dict[str, dict], elapsed: float = 0) 
 
 
 # ======================================================================================
-# SECTION 8 — Chat Agent UI (Crystal Blue Theme + Clean Layout)
+# SECTION 8 — Styling (Chat Agent Theme)
 # ======================================================================================
 
 CRYSTAL = "#0EA5E9"
 DEEP = "#0369A1"
-LIGHT = "#F0F9FF"
-MUTED = "#64748B"
+
 
 def _inject_css():
-    st.markdown(f"""
+    st.markdown("""
     <style>
-      /* Main background */
-      .stApp {{ background: #FFFFFF; }}
-      
-      /* Sidebar - minimal and clean */
-      section[data-testid="stSidebar"] {{
-        background: {LIGHT};
-        border-right: 1px solid #E2E8F0;
-      }}
-      
-      /* Typography */
-      h1, h2, h3 {{ color: {DEEP} !important; font-weight: 600 !important; }}
-      
-      /* Chat-style containers */
-      .chat-container {{
+      .stApp { background: #FFFFFF; }
+
+      section[data-testid="stSidebar"] {
         background: #F8FAFC;
-        border-radius: 12px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-        border: 1px solid #E2E8F0;
-      }}
-      .chat-user {{
-        background: #FFFFFF;
-        border-left: 4px solid {CRYSTAL};
-        padding: 0.8rem 1rem;
-        border-radius: 8px;
-        margin-bottom: 0.5rem;
-      }}
-      .chat-agent {{
-        background: #FFFFFF;
-        border-left: 4px solid {DEEP};
-        padding: 0.8rem 1rem;
-        border-radius: 8px;
-        margin-bottom: 0.5rem;
-      }}
-      
-      /* Input area */
-      .stTextArea textarea, .stTextInput input {{
+        border-right: 1px solid #E2E8F0;
+      }
+
+      h1, h2, h3 { color: #0369A1 !important; font-weight: 600 !important; }
+
+      .brand-header {
+        display: flex; align-items: center; gap: 12px;
+        padding: 0.6rem 0 0.8rem 0;
+        border-bottom: 2px solid #0EA5E9;
+        margin-bottom: 1.2rem;
+      }
+      .brand-header .brand-icon {
+        width: 38px; height: 38px; border-radius: 10px;
+        background: linear-gradient(135deg, #0EA5E9, #0369A1);
+        display: flex; align-items: center; justify-content: center;
+        color: #fff; font-size: 20px; font-weight: 700;
+        flex-shrink: 0;
+      }
+      .brand-header .brand-text {
+        font-size: 22px; font-weight: 700; color: #0369A1;
+        letter-spacing: -0.3px;
+      }
+      .brand-header .brand-sub {
+        font-size: 13px; color: #64748B; font-weight: 400;
+      }
+
+      .stTextArea textarea, .stTextInput input {
         border-radius: 12px !important;
         border: 1px solid #CBD5E1 !important;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05) !important;
-      }}
-      .stTextArea textarea:focus, .stTextInput input:focus {{
-        border-color: {CRYSTAL} !important;
-        box-shadow: 0 0 0 3px rgba(14,165,233,0.15) !important;
-      }}
-      
-      /* Primary button */
-      .stButton > button[kind="primary"] {{
-        background: {CRYSTAL};
-        color: white; border: none; border-radius: 8px;
-        padding: 0.5rem 1.2rem; font-weight: 500;
-        transition: all .15s ease;
-      }}
-      .stButton > button[kind="primary"]:hover {{
-        background: {DEEP};
-      }}
-      
-      /* Hide Streamlit branding */
-      #MainMenu {{visibility: hidden;}}
-      footer {{visibility: hidden;}}
+        font-size: 14px !important;
+      }
+      .stTextArea textarea:focus, .stTextInput input:focus {
+        border-color: #0EA5E9 !important;
+        box-shadow: 0 0 0 3px rgba(14,165,233,0.12) !important;
+      }
+
+      .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #0EA5E9, #0369A1);
+        color: white; border: none; border-radius: 10px;
+        padding: 0.55rem 1.4rem; font-weight: 600;
+        font-size: 15px; transition: all .15s ease;
+      }
+      .stButton > button[kind="primary"]:hover {
+        background: linear-gradient(135deg, #0369A1, #024a73);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(3,105,161,0.25);
+      }
+
+      .upload-hint {
+        font-size: 12px; color: #94A3B8;
+        margin: 0.3rem 0 0 0; line-height: 1.4;
+      }
+
+      .results-card {
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 14px;
+        padding: 1rem 1.2rem;
+        margin: 0.8rem 0;
+      }
+
+      .conf-pill {
+        display: inline-block; padding: 2px 10px;
+        border-radius: 12px; font-size: 12px; font-weight: 500;
+      }
+      .conf-high { background: #DCFCE7; color: #166534; }
+
+      #MainMenu { visibility: hidden; }
+      footer { visibility: hidden; }
+      header[data-testid="stHeader"] { background: transparent; }
     </style>
     """, unsafe_allow_html=True)
 
+
+# ======================================================================================
+# SECTION 9 — UI helpers
+# ======================================================================================
 
 def _render_people_table(people: list[dict]):
     rows = []
@@ -1010,13 +1030,14 @@ def _render_people_table(people: list[dict]):
             "Department": p.get("department") or "—",
             "AI Relevance": p.get("ai_relevance") or "—",
             "Notes": p.get("notes") or "—",
-            "Confidence": p.get("confidence", ""),
+            "Confidence": (p.get("confidence") or "").replace("_", " ").title(),
             "Source": _best_source(x) or "—",
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def _image_bytes(img) -> tuple[bytes, str]:
+    """Convert any image input (PIL Image, bytes, UploadedFile) to (bytes, mime)."""
     if isinstance(img, (bytes, bytearray)):
         return bytes(img), "image/png"
     if hasattr(img, "save") and not hasattr(img, "read"):
@@ -1032,52 +1053,89 @@ def _image_bytes(img) -> tuple[bytes, str]:
     return data, mime
 
 
+# ======================================================================================
+# SECTION 10 — Main app
+# ======================================================================================
+
 def main():
     _inject_css()
 
-    # ---- Sidebar (Clean & Branded) ----
+    # ── Sidebar ──
     with st.sidebar:
-        st.markdown("### Unlimited Innovations")
-        st.caption("Contact Intelligence")
+        st.markdown("""
+        <div style="text-align:center; padding: 1rem 0 0.6rem 0;">
+            <div style="font-size:22px; font-weight:700; color:#0369A1;">
+                🌐 Unlimited Innovations
+            </div>
+            <div style="font-size:13px; color:#64748B; margin-top:2px;">
+                Contact Intelligence
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         st.divider()
-        
-        if st.button("New Search", use_container_width=True, type="primary"):
+
+        if st.button("🔄  New Search", use_container_width=True, type="primary"):
             st.session_state.pop("result", None)
             st.rerun()
-            
-        if st.button("Clear History", use_container_width=True):
+
+        if st.button("🗑️  Clear History", use_container_width=True):
             SEARCH_CACHE._d.clear()
             PROFILE_CACHE._d.clear()
             st.session_state.pop("result", None)
-            st.success("Cleared.")
+            st.success("History cleared!")
 
-    # ---- Main Chat Interface ----
-    st.title("How can I help you today?")
-    st.write("Paste an email header, a list of contacts, or drop a screenshot to get started.")
+        st.divider()
+        st.markdown("##### Options")
+        inc_sender = st.checkbox("Include sender (From field)", value=True, key="opt_sender")
+        bypass_cache = st.checkbox("Fresh search (ignore saved)", key="opt_fresh")
 
-    # Input section
+        st.divider()
+        st.caption("Powered by AI · Unlimited Innovations India Pvt. Ltd.")
+
+    # ── Top branding ──
+    st.markdown("""
+    <div class="brand-header">
+        <div class="brand-icon">UI</div>
+        <div>
+            <div class="brand-text">Unlimited Innovations</div>
+            <div class="brand-sub">AI-Powered Contact Intelligence</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Greeting ──
+    if "result" not in st.session_state:
+        st.markdown("### 👋 How can I help you today?")
+        st.write("Paste an email, a list of contacts, or drop a screenshot — I'll find their profiles.")
+
+    if not S.ready:
+        st.error("The system is not configured yet. Please contact your administrator.")
+        st.stop()
+
+    # ── Input area ──
     with st.container():
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
+        col_main, col_img = st.columns([3, 1.2])
+
+        with col_main:
             raw_text = st.text_area(
-                "Paste text here...",
-                height=120,
-                placeholder="e.g. Jane Doe <jane@acme.com>",
+                "Paste email headers, names, or contact info here…",
+                height=130,
+                placeholder="e.g. Jane Doe <jane@acme.com>, John Smith <john@example.org>",
                 label_visibility="collapsed",
             )
             context_hint = st.text_input(
-                "Company context (optional)",
-                placeholder="e.g. Acme Corp",
+                "Company or context (optional)",
+                placeholder="e.g. Acme Corp — helps improve accuracy",
                 label_visibility="collapsed",
             )
-        
-        with col2:
-            st.write("**Image Input**")
+
+        with col_img:
+            st.markdown("**📎 Image Input**")
             pasted_image = None
+
             if _HAS_PASTE_BTN:
                 res = pbutton(
-                    "📋 Paste",
+                    "📋 Paste from clipboard",
                     text_color="#ffffff",
                     background_color=CRYSTAL,
                     hover_background_color=DEEP,
@@ -1086,111 +1144,135 @@ def main():
                 )
                 if res and res.image_data is not None:
                     pasted_image = res.image_data
-                    st.image(pasted_image, width=100)
-            
+                    st.image(pasted_image, width=120, caption="Pasted image")
+
             uploaded = st.file_uploader(
-                "Upload",
+                "Or upload images",
                 type=["png", "jpg", "jpeg", "webp"],
                 accept_multiple_files=True,
                 label_visibility="collapsed",
             )
+            st.markdown('<p class="upload-hint">Screenshots, business cards, meeting invites, '
+                        'or any image with contact info.</p>', unsafe_allow_html=True)
 
-    # Process button
-    can_run = S.ready and (bool(raw_text.strip()) or pasted_image is not None or bool(uploaded))
-    if not S.ready:
-        st.warning("System is not fully configured. Please check environment variables.")
-    
-    if st.button("Send", type="primary", disabled=not can_run, use_container_width=True):
+    # ── Send button ──
+    can_run = bool(raw_text.strip()) or pasted_image is not None or bool(uploaded)
+
+    if st.button("🔍  Find Contacts", type="primary", disabled=not can_run, use_container_width=True):
         all_contacts: list[Contact] = []
         seen: set[str] = set()
 
         if raw_text.strip():
-            with st.spinner("Parsing text..."):
-                tc, _ = smart_parse(raw_text, S, context_hint, False)
+            with st.spinner("Reading your text…"):
+                try:
+                    tc, _ = smart_parse(raw_text, S, context_hint, inc_sender)
+                except Exception:
+                    tc = []
                 for c in tc:
                     if c.email not in seen:
                         seen.add(c.email)
                         all_contacts.append(c)
 
         if pasted_image is not None:
-            with st.spinner("Reading image..."):
+            with st.spinner("Reading pasted image…"):
                 data, mime = _image_bytes(pasted_image)
-                ic, _ = contacts_from_image(data, S, mime, True)
+                try:
+                    ic, _ = contacts_from_image(data, S, mime, inc_sender)
+                except Exception:
+                    ic = []
                 for c in ic:
                     if c.email not in seen:
                         seen.add(c.email)
                         all_contacts.append(c)
 
         for img in uploaded or []:
-            with st.spinner("Reading image..."):
+            with st.spinner(f"Reading {img.name}…"):
                 data, mime = _image_bytes(img)
-                ic, _ = contacts_from_image(data, S, mime, True)
+                try:
+                    ic, _ = contacts_from_image(data, S, mime, inc_sender)
+                except Exception:
+                    ic = []
                 for c in ic:
                     if c.email not in seen:
                         seen.add(c.email)
                         all_contacts.append(c)
 
         all_contacts = all_contacts[:S.max_contacts]
+
         if not all_contacts:
-            st.warning("No contacts found.")
+            st.warning("No contacts found. Try pasting email headers or uploading a clearer image.")
         else:
-            st.info(f"Researching {len(all_contacts)} contact(s)...")
-            progress = st.progress(0.0, text="Starting...")
+            st.info(f"Found {len(all_contacts)} contact(s). Researching now…")
+            progress = st.progress(0.0, text="Starting…")
             result = None
-            for event in run_lookup(all_contacts, context_hint, S, force=False):
+            for event in run_lookup(all_contacts, context_hint, S, force=bypass_cache):
                 if event["type"] == "progress":
-                    progress.progress(event["done"] / max(event["total"], 1), text=event["message"])
+                    pct = event["done"] / max(event["total"], 1)
+                    progress.progress(pct, text=event["message"])
                 elif event["type"] == "result":
                     result = event["data"]
             progress.empty()
             if result:
                 st.session_state["result"] = result
 
-    # ---- Results Display (Chat Agent Style) ----
+    # ── Results ──
     result = st.session_state.get("result")
     if not result:
         return
 
     st.divider()
-    st.subheader("Results")
-    
+
     people, companies = result["people"], result["companies"]
-    
-    # Render as a clean card
-    with st.container():
-        st.markdown(f"**{len(people)} contacts found** in {result['elapsed']}s.")
-        _render_people_table(people)
+    n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
 
-        with st.expander("Company profiles"):
-            if companies:
-                st.dataframe(_build_company_df(companies), use_container_width=True, hide_index=True)
+    st.markdown(f"""
+    <div class="results-card">
+        <div style="font-size:18px; font-weight:600; color:#0369A1; margin-bottom:6px;">
+            ✅ Research Complete
+        </div>
+        <div style="color:#475569; font-size:14px;">
+            <strong>{len(people)}</strong> contacts found
+            · <span class="conf-pill conf-high">{n_high} high confidence</span>
+            · {len(companies)} companies
+            · completed in {result['elapsed']}s
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-        if result.get("notes"):
-            with st.expander("Notes"):
-                for n in result["notes"]:
-                    st.write(f"- {n}")
+    st.markdown("#### 👥 Contacts")
+    _render_people_table(people)
 
-        st.write("**Download**")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.download_button("CSV", data=to_csv(people, companies),
-                               file_name="contacts.csv", mime="text/csv", use_container_width=True)
-        with c2:
-            try:
-                st.download_button("Excel", data=to_xlsx(people, companies),
-                                   file_name="contacts.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True)
-            except Exception as e:
-                st.caption(f"Unavailable: {e}")
-        with c3:
-            try:
-                st.download_button("Word", data=to_docx(people, companies, result.get("elapsed", 0)),
-                                   file_name="contacts.docx",
-                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                   use_container_width=True)
-            except Exception as e:
-                st.caption(f"Unavailable: {e}")
+    if companies:
+        with st.expander("🏢 Company Profiles"):
+            st.dataframe(_build_company_df(companies), use_container_width=True, hide_index=True)
+
+    if result.get("notes"):
+        with st.expander("📝 Notes"):
+            for n in result["notes"]:
+                st.write(f"• {n}")
+
+    st.markdown("#### 📥 Download Results")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.download_button("📄 CSV", data=to_csv(people, companies),
+                           file_name="contacts.csv", mime="text/csv",
+                           use_container_width=True)
+    with d2:
+        try:
+            st.download_button("📊 Excel", data=to_xlsx(people, companies),
+                               file_name="contacts.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
+        except Exception as e:
+            st.caption(f"Unavailable: {e}")
+    with d3:
+        try:
+            st.download_button("📝 Word", data=to_docx(people, companies, result.get("elapsed", 0)),
+                               file_name="contacts.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               use_container_width=True)
+        except Exception as e:
+            st.caption(f"Unavailable: {e}")
 
 
 if __name__ == "__main__":
