@@ -25,6 +25,17 @@ from openai import OpenAI
 
 load_dotenv()
 
+# Theme set in code (replaces .streamlit/config.toml). Must run before set_page_config.
+for _k, _v in {
+    "theme.base": "light", "theme.primaryColor": "#1F4FD8", "theme.backgroundColor": "#FFFFFF",
+    "theme.secondaryBackgroundColor": "#F1F5F9", "theme.textColor": "#0F172A",
+    "browser.gatherUsageStats": False,
+}.items():
+    try:
+        st._config.set_option(_k, _v)
+    except Exception:
+        pass
+
 log = logging.getLogger("ubti.lookup")
 logging.basicConfig(level=logging.INFO)
 
@@ -1087,6 +1098,12 @@ html,body,[class*="css"]{font-family:'Inter','Segoe UI',system-ui,sans-serif;}
 .brand{font-weight:700;font-size:1.05rem;color:#F8FAFC;letter-spacing:.2px;margin-bottom:.2rem;}
 .brand b{color:#60A5FA;}
 .side-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#64748B;margin:.9rem 0 .3rem;}
+
+/* accent fallback if theme options are ignored */
+.stProgress>div>div>div>div{background:var(--accent);}
+.main .stButton>button[kind="primary"],.stDownloadButton>button{border-color:var(--accent);}
+.stDownloadButton>button{color:var(--accent);font-weight:600;}
+.stDownloadButton>button:hover{background:var(--accent);color:#fff;border-color:var(--accent);}
 
 /* chat */
 [data-testid="stChatMessage"]{background:transparent;padding:.6rem 0;}
