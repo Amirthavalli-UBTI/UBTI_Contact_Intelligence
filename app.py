@@ -10,54 +10,43 @@ import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
+from html import escape as esc
 from typing import Iterator
+from urllib.parse import urlparse
+from xml.sax.saxutils import escape as xesc
 
-import pandas as pd
 import requests
 import streamlit as st
+from dotenv import load_dotenv
 from openai import OpenAI
 
-# ---- Load .env FIRST, then every key via os.getenv ----
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-# Optional clipboard-paste component (Ctrl+V support)
-try:
-    from streamlit_paste_button import paste_image_button as pbutton
-    _HAS_PASTE_BTN = True
-except Exception:
-    pbutton = None
-    _HAS_PASTE_BTN = False
+load_dotenv()
 
 log = logging.getLogger("ubti.lookup")
 logging.basicConfig(level=logging.INFO)
 
 st.set_page_config(
-    page_title="Unlimited Innovations — Contact Intelligence",
-    page_icon="🌐",
+    page_title="UBTI Contact Intelligence",
+    page_icon="◆",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ======================================================================================
-# SECTION 1 — Constants & settings
+# SECTION 1 — Constants, settings, caches
 # ======================================================================================
 
 FREE_MAIL_DOMAINS = {
     "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "live.com", "icloud.com",
     "aol.com", "proton.me", "protonmail.com", "zoho.com", "rediffmail.com", "yahoo.co.in",
 }
-
 PEOPLE_SITES = [
     "linkedin.com", "zoominfo.com", "rocketreach.co", "theorg.com",
     "contactout.com", "signalhire.com", "crunchbase.com", "apollo.io",
 ]
-
 CONFIDENCE = ("high", "medium", "low", "not_found")
 
 
@@ -95,16 +84,16 @@ class Settings:
 def load_settings() -> Settings:
     def i(k: str, d: int) -> int:
         try:
-            return max(1, int(os.getenv(k, str(d))))
-        except (TypeError, ValueError):
+            return max(1, int(os.getenv(k, str(d)) or d))
+        except ValueError:
             return d
 
     depth = (os.getenv("TAVILY_SEARCH_DEPTH", "basic") or "basic").strip().lower()
     return Settings(
-        azure_endpoint=(os.getenv("AZURE_OPENAI_ENDPOINT", "") or "").strip(),
-        azure_key=(os.getenv("AZURE_OPENAI_API_KEY", "") or "").strip(),
-        deployment=(os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1") or "gpt-4.1").strip(),
-        tavily_key=(os.getenv("TAVILY_API_KEY", "") or "").strip(),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "").strip(),
+        azure_key=os.getenv("AZURE_OPENAI_API_KEY", "").strip(),
+        deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1").strip(),
+        tavily_key=os.getenv("TAVILY_API_KEY", "").strip(),
         tavily_depth=depth if depth in ("basic", "advanced") else "basic",
         websearch_budget=i("WEBSEARCH_BUDGET_SECONDS", 30),
         io_workers=i("IO_WORKERS", 12),
@@ -142,6 +131,10 @@ class TTLCache:
                 self._d.pop(next(iter(self._d)))
             self._d[key] = (time.time() + self.ttl, copy.deepcopy(value))
 
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
+
 
 @st.cache_resource(show_spinner=False)
 def _caches() -> tuple[TTLCache, TTLCache]:
@@ -156,7 +149,7 @@ def _h(*parts) -> str:
 
 
 # ======================================================================================
-# SECTION 2 — Contact parsing
+# SECTION 2 — Contact parsing (text + image)
 # ======================================================================================
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -215,8 +208,7 @@ def parse_contacts(raw: str, company_hint: str = "", include_sender: bool = Fals
     for line in lines:
         m = HEADER_RE.match(line)
         if m:
-            current = m.group(1).lower()
-            body = m.group(2)
+            current, body = m.group(1).lower(), m.group(2)
         else:
             body = line
             if not line.strip():
@@ -226,102 +218,38 @@ def parse_contacts(raw: str, company_hint: str = "", include_sender: bool = Fals
     return out
 
 
-# ── Azure vision: extract contacts from an image ──────────────────────────────
+IMAGE_EXTRACT_PROMPT = """You are an assistant that extracts contact information from images of emails, meeting invites,
+business cards, chat screenshots, or any document that contains people's names and email addresses.
 
-IMAGE_EXTRACT_PROMPT = """You extract contact information from images of emails, meeting invites,
-business cards, chat screenshots, or any document containing people's names and email addresses.
+Extract ALL people mentioned with their:
+- full_name: the person's display name
+- email: their email address (if visible)
+- company_hint: the company name if you can determine it from the domain, signature, or context
 
-Return a JSON object with this EXACT shape:
+Return a JSON object with this exact shape:
 {
   "contacts": [
-    {"full_name": "Jane Doe", "email": "jane@acme.com", "company_hint": "Acme"}
+    {"full_name": "...", "email": "...", "company_hint": "..."}
   ],
-  "company_context": "any overall company or meeting context",
-  "raw_text": "all readable text, preserving structure"
+  "company_context": "any overall company or meeting context you can extract",
+  "raw_text": "the full text you can read from the image, preserving structure"
 }
 
 Rules:
-- Extract EVERY person (including the sender/From)
-- Copy email addresses exactly as shown; if only a name is visible, set email to ""
-- Derive company_hint from the email domain, signature, or visible company names
-- raw_text must contain everything readable — headers, subject, body, signatures
-- Return ONLY the JSON object — no markdown, no explanation"""
+- Extract EVERY person, including From/sender
+- If you can see email addresses, include them exactly as shown
+- If you can only see names without emails, still include them with email as ""
+- For company_hint, derive from email domain or any company names visible
+- In raw_text, include everything you can read — headers, subject lines, signatures, body text
+- Be thorough — do not skip anyone
+- Return ONLY the JSON object, no markdown or explanation"""
 
+SMART_PARSE_PROMPT = """You are an assistant that extracts contact information from messy, unstructured text.
 
-def azure_client(s: Settings, timeout: int, retries: int) -> OpenAI:
-    m = re.match(r"(https?://[^/\s]+)", s.azure_endpoint.strip())
-    base = (m.group(1) if m else s.azure_endpoint.rstrip("/")) + "/openai/v1/"
-    return OpenAI(base_url=base, api_key=s.azure_key, timeout=timeout, max_retries=retries)
-
-
-def extract_json(text: str) -> dict:
-    text = (text or "").strip()
-    try:
-        val = json.loads(text)
-        return val if isinstance(val, dict) else {"_parse_error": text[:300]}
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", text, re.S)
-    if m:
-        try:
-            val = json.loads(m.group(0))
-            if isinstance(val, dict):
-                return val
-        except Exception:
-            pass
-    return {"_parse_error": text[:300]}
-
-
-def extract_contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png") -> dict:
-    if not image_bytes:
-        return {"contacts": [], "company_context": "", "raw_text": ""}
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    client = azure_client(s, s.synth_timeout + 30, retries=2)
-    resp = client.chat.completions.create(
-        model=s.deployment,
-        messages=[
-            {"role": "system",
-             "content": "You extract contact information from images. Return only valid JSON."},
-            {"role": "user", "content": [
-                {"type": "text", "text": IMAGE_EXTRACT_PROMPT},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}},
-            ]},
-        ],
-        response_format={"type": "json_object"},
-        max_tokens=2000,
-    )
-    return extract_json(resp.choices[0].message.content)
-
-
-def contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png",
-                        include_sender: bool = True) -> tuple[list[Contact], str]:
-    data = extract_contacts_from_image(image_bytes, s, mime)
-    contacts: list[Contact] = []
-    seen: set[str] = set()
-    hint = str(data.get("company_context") or "").strip()
-    raw_text = str(data.get("raw_text") or "")
-
-    for entry in data.get("contacts") or []:
-        email = str(entry.get("email") or "").strip().lower()
-        name = str(entry.get("full_name") or "").strip()
-        c_hint = str(entry.get("company_hint") or hint).strip()
-        if email and EMAIL_RE.fullmatch(email) and email not in seen:
-            seen.add(email)
-            local, domain = email.split("@", 1)
-            contacts.append(Contact(
-                email=email, display_name=name, local=local, domain=domain,
-                name_guess=name or guess_name_from_local(local), company_hint=c_hint,
-            ))
-
-    if raw_text:
-        contacts.extend(_chunks_to_contacts(raw_text, hint, seen))
-    return contacts, hint
-
-
-# ── Smart parsing for messy / unstructured text ───────────────────────────────
-
-SMART_PARSE_PROMPT = """You extract contact information from messy, unstructured text.
+Extract ALL people you can identify with their:
+- full_name: the person's name
+- email: their email address (if present)
+- company_hint: company name if you can determine it
 
 Return a JSON object:
 {
@@ -333,55 +261,63 @@ Return a JSON object:
 
 Rules:
 - Include EVERY person mentioned
-- If a name appears without an email, include it with email: ""
+- If names appear without emails, include them (email: "")
 - Look for company names ANYWHERE in the text
 - Handle Indian name patterns: initials like "Ganesh R", "Venkatesh M"
-- A domain like @ak.com.sa may indicate "Al Abdul Karim" — use context
+- An email domain like @ak.com.sa means the company might be "Al Abdul Karim" or similar
 - Return ONLY the JSON, no markdown"""
 
 
-def llm_json(s: Settings, system: str, user: str) -> dict:
-    client = azure_client(s, s.synth_timeout, retries=2)
-    data: dict = {}
-    for _ in range(2):
-        resp = client.chat.completions.create(
-            model=s.deployment,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format={"type": "json_object"},
-        )
-        data = extract_json(resp.choices[0].message.content)
-        if "_parse_error" not in data:
-            return data
-        user += "\n\nReturn ONLY one valid JSON object."
-    return data
+def _llm_entries_to_contacts(data: dict, hint: str, seen: set[str]) -> list[Contact]:
+    out: list[Contact] = []
+    for entry in data.get("contacts") or []:
+        if not isinstance(entry, dict):
+            continue
+        email = str(entry.get("email") or "").strip().lower()
+        name = str(entry.get("full_name") or "").strip()
+        c_hint = str(entry.get("company_hint") or hint).strip()
+        if email and EMAIL_RE.fullmatch(email) and email not in seen:
+            seen.add(email)
+            local, domain = email.split("@", 1)
+            out.append(Contact(email=email, display_name=name, local=local, domain=domain,
+                               name_guess=name or guess_name_from_local(local), company_hint=c_hint))
+    return out
 
 
-def smart_parse(raw: str, s: Settings, company_hint: str = "",
-                include_sender: bool = False) -> tuple[list[Contact], str]:
+def contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png") -> list[Contact]:
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    client = azure_client(s, s.synth_timeout + 30, retries=2)
+    resp = client.chat.completions.create(
+        model=s.deployment,
+        messages=[
+            {"role": "system", "content": "You extract contact information from images. Return only valid JSON."},
+            {"role": "user", "content": [
+                {"type": "text", "text": IMAGE_EXTRACT_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}},
+            ]},
+        ],
+        response_format={"type": "json_object"},
+    )
+    data = extract_json(resp.choices[0].message.content)
+    hint = str(data.get("company_context") or "").strip()
+    seen: set[str] = set()
+    contacts = _llm_entries_to_contacts(data, hint, seen)
+    raw_text = str(data.get("raw_text") or "")
+    if raw_text:
+        contacts.extend(_chunks_to_contacts(raw_text, hint, seen))
+    return contacts
+
+
+def smart_parse(raw: str, s: Settings, company_hint: str = "", include_sender: bool = False) -> list[Contact]:
     fast = parse_contacts(raw, company_hint, include_sender)
     if fast:
-        return fast, company_hint
-
+        return fast
     prompt = f"Extract contacts from this text:\n\n{raw}"
     if company_hint:
         prompt += f"\n\nAdditional context from the user: {company_hint}"
     data = llm_json(s, SMART_PARSE_PROMPT, prompt)
-
-    contacts: list[Contact] = []
-    seen: set[str] = set()
-    llm_hint = str(data.get("company_context") or company_hint).strip()
-    for entry in data.get("contacts") or []:
-        email = str(entry.get("email") or "").strip().lower()
-        name = str(entry.get("full_name") or "").strip()
-        c_hint = str(entry.get("company_hint") or llm_hint).strip()
-        if email and EMAIL_RE.fullmatch(email) and email not in seen:
-            seen.add(email)
-            local, domain = email.split("@", 1)
-            contacts.append(Contact(
-                email=email, display_name=name, local=local, domain=domain,
-                name_guess=name or guess_name_from_local(local), company_hint=c_hint,
-            ))
-    return contacts, llm_hint
+    hint = str(data.get("company_context") or company_hint).strip()
+    return _llm_entries_to_contacts(data, hint, set())
 
 
 # ======================================================================================
@@ -415,6 +351,46 @@ def tavily_search(s: Settings, query: str, include_domains: tuple[str, ...] | No
            for x in r.json().get("results", []) if x.get("url")]
     SEARCH_CACHE.set(key, out)
     return out
+
+
+def azure_client(s: Settings, timeout: int, retries: int) -> OpenAI:
+    m = re.match(r"(https?://[^/\s]+)", s.azure_endpoint.strip())
+    base = (m.group(1) if m else s.azure_endpoint.rstrip("/")) + "/openai/v1/"
+    return OpenAI(base_url=base, api_key=s.azure_key, timeout=timeout, max_retries=retries)
+
+
+def extract_json(text: str) -> dict:
+    text = (text or "").strip()
+    try:
+        val = json.loads(text)
+        return val if isinstance(val, dict) else {"_parse_error": text[:300]}
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        try:
+            val = json.loads(m.group(0))
+            if isinstance(val, dict):
+                return val
+        except Exception:
+            pass
+    return {"_parse_error": text[:300]}
+
+
+def llm_json(s: Settings, system: str, user: str) -> dict:
+    client = azure_client(s, s.synth_timeout, retries=2)
+    data: dict = {}
+    for _ in range(2):
+        resp = client.chat.completions.create(
+            model=s.deployment,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+        )
+        data = extract_json(resp.choices[0].message.content)
+        if "_parse_error" not in data:
+            return data
+        user += "\n\nReturn ONLY one valid JSON object."
+    return data
 
 
 def azure_web_search(s: Settings, prompt: str) -> tuple[dict, list[str]]:
@@ -536,15 +512,12 @@ def normalize_company(d: dict, domain: str, allowed: set[str]) -> dict:
                                      "what_they_do", "size", "parent_or_group")}
     out["company_name"] = out["company_name"] or domain
     out["domain"] = out["domain"] or domain
-    out["other_offices"] = ([_s(x) for x in (d.get("other_offices") or []) if _s(x)]
-                            if isinstance(d.get("other_offices"), list) else [])
-    out["products"] = ([_s(x) for x in (d.get("products") or []) if _s(x)]
-                       if isinstance(d.get("products"), list) else [])
-    lead = []
-    for x in d.get("key_leadership") or []:
-        if isinstance(x, dict) and _s(x.get("name")):
-            lead.append({"name": _s(x.get("name")), "title": _s(x.get("title"))})
-    out["key_leadership"] = lead
+    for k in ("other_offices", "products"):
+        v = d.get(k)
+        out[k] = [_s(x) for x in v if _s(x)] if isinstance(v, list) else []
+    out["key_leadership"] = [{"name": _s(x.get("name")), "title": _s(x.get("title"))}
+                             for x in d.get("key_leadership") or []
+                             if isinstance(x, dict) and _s(x.get("name"))]
     out["sources"] = list(dict.fromkeys(u for u in _urls(d.get("sources")) if _norm_url(u) in allowed))
     return out
 
@@ -555,11 +528,9 @@ def normalize_person(d: dict, c: Contact, allowed: set[str]) -> dict:
                                      "summary", "linkedin_url", "match_reasoning")}
     if out["ai_relevance"] not in ("Very High", "High", "Medium", "Low"):
         out["ai_relevance"] = "Medium" if out["current_title"] else ""
-    roles = []
-    for r in d.get("previous_roles") or []:
-        if isinstance(r, dict) and (_s(r.get("title")) or _s(r.get("company"))):
-            roles.append({k: _s(r.get(k)) for k in ("title", "company", "period")})
-    out["previous_roles"] = roles
+    out["previous_roles"] = [{k: _s(r.get(k)) for k in ("title", "company", "period")}
+                             for r in d.get("previous_roles") or []
+                             if isinstance(r, dict) and (_s(r.get("title")) or _s(r.get("company")))]
     ap = c.apollo or {}
     if ap:
         out["current_title"] = out["current_title"] or _s(ap.get("title"))
@@ -619,7 +590,7 @@ def _ws_result(f: Future | None, deadline: float, notes: list[str]) -> tuple[dic
         return {}, []
     wait([f], timeout=max(0.0, deadline - time.time()))
     if not f.done():
-        notes.append("Azure web search was still running; results built from faster sources.")
+        notes.append("Azure web search was still running; results were built from the faster sources.")
         return {}, []
     val, err = f.result()
     if err or not val:
@@ -659,8 +630,7 @@ def _company_job(domain: str, hint: str, s: Settings, io_pool: ThreadPoolExecuto
     allowed = {_norm_url(r["url"]) for r in ev} | {_norm_url(u) for u in ws_urls}
     user = company_task(domain, hint) + "\n\nEVIDENCE (web results):\n" + json.dumps(ev, ensure_ascii=False)
     if ws_data:
-        user += "\n\nWEB-SEARCH FINDINGS:\n" + json.dumps(
-            {"findings": ws_data, "urls": ws_urls}, ensure_ascii=False)
+        user += "\n\nWEB-SEARCH FINDINGS:\n" + json.dumps({"findings": ws_data, "urls": ws_urls}, ensure_ascii=False)
     try:
         raw = llm_json(s, SYSTEM_RULES, user)
     except Exception as e:
@@ -773,7 +743,7 @@ def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = Fa
         label.update({f: ("person", e) for e, f in person_f.items()})
         names = {c.email: c.name_guess for c in contacts}
         total, done = len(label), 0
-        yield {"type": "progress", "done": 0, "total": total, "message": "Searching the web…"}
+        yield {"type": "progress", "done": 0, "total": total, "message": "Searching the web in parallel…"}
         for f in as_completed(label):
             done += 1
             kind, ident = label[f]
@@ -814,465 +784,626 @@ def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = Fa
 
 
 # ======================================================================================
-# SECTION 7 — Exports
+# SECTION 7 — Tabular model + exports (PDF / Word / Excel)
 # ======================================================================================
 
+NAVY, BLUE, SLATE, LINE, ZEBRA = "0F172A", "1F4FD8", "475569", "E2E8F0", "F8FAFC"
+
+PEOPLE_COLS = ["S.No", "Name", "Title", "Company", "Department", "AI Relevance",
+               "Confidence", "Notes", "Source"]
+COMPANY_COLS = ["Company", "Domain", "Industry", "Headquarters", "Size", "Parent / Group", "What they do"]
+
+
 def _best_source(item: dict) -> str:
-    for u in item.get("profile", {}).get("sources") or []:
+    p = item.get("profile", {})
+    for u in p.get("sources") or []:
         if u and u.startswith("http"):
             return u
-    li = item.get("profile", {}).get("linkedin_url", "")
-    return li if li and li.startswith("http") else ""
+    li = p.get("linkedin_url", "")
+    return li if li.startswith("http") else ""
 
 
-def _build_df(people: list[dict]) -> pd.DataFrame:
+def _conf_label(c: str) -> str:
+    return (c or "").replace("_", " ").title()
+
+
+def people_rows(people: list[dict]) -> list[dict]:
     rows = []
-    for idx, x in enumerate(people, 1):
+    for i, x in enumerate(people, 1):
         p, c = x["profile"], x["contact"]
         rows.append({
-            "S.No": idx,
+            "S.No": str(i),
             "Name": p.get("full_name") or c["name_guess"],
             "Title": p.get("current_title", ""),
+            "Company": p.get("current_company", ""),
             "Department": p.get("department", ""),
-            "AI Relevance / Interest": p.get("ai_relevance", ""),
+            "AI Relevance": p.get("ai_relevance", ""),
+            "Confidence": _conf_label(p.get("confidence", "")),
             "Notes": p.get("notes", ""),
             "Source": _best_source(x),
         })
-    return pd.DataFrame(rows)
+    return rows
 
 
-def _build_company_df(companies: dict[str, dict]) -> pd.DataFrame:
-    rows = [{
-        "Company": co.get("company_name", d),
-        "Domain": d,
-        "Industry": co.get("industry", ""),
-        "Headquarters": co.get("headquarters", ""),
-        "Size": co.get("size", ""),
-        "Parent / Group": co.get("parent_or_group", ""),
+def company_rows(companies: dict[str, dict]) -> list[dict]:
+    return [{
+        "Company": co.get("company_name", d), "Domain": d,
+        "Industry": co.get("industry", ""), "Headquarters": co.get("headquarters", ""),
+        "Size": co.get("size", ""), "Parent / Group": co.get("parent_or_group", ""),
         "What they do": co.get("what_they_do", ""),
     } for d, co in companies.items()]
-    return pd.DataFrame(rows)
 
 
-def to_csv(people: list[dict], companies: dict[str, dict]) -> bytes:
-    return _build_df(people).to_csv(index=False).encode("utf-8-sig")
+def _domain_of(url: str) -> str:
+    return (urlparse(url).netloc or url).removeprefix("www.")
 
 
 def to_xlsx(people: list[dict], companies: dict[str, dict]) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    thin = Side(style="thin", color=LINE)
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor=NAVY)
+    zebra = PatternFill("solid", fgColor=ZEBRA)
+    conf_fill = {"High": "DCFCE7", "Medium": "FEF3C7", "Low": "FEE2E2", "Not Found": "E2E8F0"}
+
+    def sheet(ws, cols, rows, widths):
+        ws.append(cols)
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
+            c.fill, c.border = head_fill, border
+            c.alignment = Alignment(vertical="center", horizontal="left", wrap_text=True)
+        ws.row_dimensions[1].height = 24
+        for r_i, r in enumerate(rows, 2):
+            ws.append([r[c] for c in cols])
+            for c_i, col in enumerate(cols, 1):
+                cell = ws.cell(r_i, c_i)
+                cell.border = border
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.font = Font(name="Calibri", size=10)
+                if r_i % 2 == 1:
+                    cell.fill = zebra
+                if col == "Source" and str(cell.value).startswith("http"):
+                    cell.hyperlink = cell.value
+                    cell.value = _domain_of(cell.value)
+                    cell.font = Font(name="Calibri", size=10, color=BLUE, underline="single")
+                if col == "Confidence" and cell.value in conf_fill:
+                    cell.fill = PatternFill("solid", fgColor=conf_fill[cell.value])
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "People"
+    sheet(ws, PEOPLE_COLS, people_rows(people), [7, 24, 32, 26, 18, 14, 13, 44, 24])
+    if companies:
+        sheet(wb.create_sheet("Companies"), COMPANY_COLS, company_rows(companies),
+              [26, 22, 22, 24, 16, 26, 60])
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        _build_df(people).to_excel(w, sheet_name="People", index=False)
-        if companies:
-            _build_company_df(companies).to_excel(w, sheet_name="Companies", index=False)
+    wb.save(buf)
     return buf.getvalue()
 
 
 def to_docx(people: list[dict], companies: dict[str, dict], elapsed: float = 0) -> bytes:
     from docx import Document
-    from docx.shared import Pt, RGBColor
+    from docx.enum.section import WD_ORIENT
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Mm, Pt, RGBColor
 
     doc = Document()
-    style = doc.styles["Normal"]
-    style.font.name = "Calibri"
-    style.font.size = Pt(10)
+    sec = doc.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = Mm(297), Mm(210)
+    for side in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+        setattr(sec, side, Mm(12))
+    st_ = doc.styles["Normal"]
+    st_.font.name, st_.font.size = "Calibri", Pt(9)
 
-    t = doc.add_heading("Contact Intelligence Report", level=0)
-    for run in t.runs:
-        run.font.size = Pt(20)
-        run.font.color.rgb = RGBColor(0x03, 0x69, 0xA1)
+    def shade(cell, fill):
+        tcPr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), fill)
+        tcPr.append(shd)
 
+    def link(par, url, text):
+        r_id = par.part.relate_to(url, RT.HYPERLINK, is_external=True)
+        h = OxmlElement("w:hyperlink")
+        h.set(qn("r:id"), r_id)
+        r = OxmlElement("w:r")
+        rpr = OxmlElement("w:rPr")
+        col = OxmlElement("w:color")
+        col.set(qn("w:val"), BLUE)
+        u = OxmlElement("w:u")
+        u.set(qn("w:val"), "single")
+        rpr.append(col)
+        rpr.append(u)
+        r.append(rpr)
+        t = OxmlElement("w:t")
+        t.text = text
+        r.append(t)
+        h.append(r)
+        par._p.append(h)
+
+    def table(cols, rows, widths_mm):
+        t = doc.add_table(rows=1, cols=len(cols))
+        t.style = "Table Grid"
+        t.autofit = False
+        for i, h in enumerate(cols):
+            c = t.rows[0].cells[i]
+            c.width = Mm(widths_mm[i])
+            c.text = ""
+            run = c.paragraphs[0].add_run(h)
+            run.bold, run.font.size = True, Pt(9)
+            run.font.color.rgb = RGBColor(255, 255, 255)
+            shade(c, NAVY)
+        for r_i, r in enumerate(rows):
+            cells = t.add_row().cells
+            for i, col in enumerate(cols):
+                cells[i].width = Mm(widths_mm[i])
+                v = str(r[col])
+                par = cells[i].paragraphs[0]
+                if col == "Source" and v.startswith("http"):
+                    link(par, v, _domain_of(v))
+                else:
+                    par.add_run(v).font.size = Pt(8.5)
+                if r_i % 2 == 1:
+                    shade(cells[i], ZEBRA)
+        return t
+
+    h = doc.add_heading("Contact Intelligence Report", level=0)
+    for run in h.runs:
+        run.font.size, run.font.color.rgb = Pt(22), RGBColor.from_string(BLUE)
     n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
-    doc.add_paragraph(
-        f"{len(people)} contacts · {n_high} high confidence · "
-        f"{len(companies)} companies · {elapsed}s research time"
-    )
-
+    doc.add_paragraph(f"{len(people)} contacts · {n_high} high confidence · "
+                      f"{len(companies)} companies · {elapsed}s research time")
     doc.add_heading("People", level=1)
-    headers = ["S.No", "Name", "Title", "Department", "AI Relevance", "Notes", "Source"]
-    table = doc.add_table(rows=1, cols=len(headers))
-    table.style = "Light Grid Accent 1"
-    for i, h in enumerate(headers):
-        cell = table.rows[0].cells[i]
-        cell.text = h
-        for r in cell.paragraphs[0].runs:
-            r.bold = True
-            r.font.size = Pt(9)
-
-    for idx, x in enumerate(people, 1):
-        p, c = x["profile"], x["contact"]
-        cells = table.add_row().cells
-        values = [str(idx), p.get("full_name") or c["name_guess"], p.get("current_title", ""),
-                  p.get("department", ""), p.get("ai_relevance", ""), p.get("notes", ""),
-                  _best_source(x)]
-        for i, v in enumerate(values):
-            cells[i].text = v
-
+    table(PEOPLE_COLS, people_rows(people), [9, 36, 48, 38, 28, 22, 20, 52, 24])
     if companies:
         doc.add_heading("Companies", level=1)
-        cheaders = ["Company", "Domain", "Industry", "HQ", "Parent / Group"]
-        ctable = doc.add_table(rows=1, cols=len(cheaders))
-        ctable.style = "Light Grid Accent 1"
-        for i, h in enumerate(cheaders):
-            ctable.rows[0].cells[i].text = h
-        for d, co in companies.items():
-            cells = ctable.add_row().cells
-            vals = [co.get("company_name", d), d, co.get("industry", ""),
-                    co.get("headquarters", ""), co.get("parent_or_group", "")]
-            for i, v in enumerate(vals):
-                cells[i].text = v
-
+        table(COMPANY_COLS, company_rows(companies), [40, 36, 34, 38, 24, 36, 69])
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-# ======================================================================================
-# SECTION 8 — Styling (Chat Agent Theme)
-# ======================================================================================
+def to_pdf(people: list[dict], companies: dict[str, dict], elapsed: float = 0) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-CRYSTAL = "#0EA5E9"
-DEEP = "#0369A1"
+    navy, blue = colors.HexColor("#" + NAVY), colors.HexColor("#" + BLUE)
+    ss = getSampleStyleSheet()
+    cell = ParagraphStyle("cell", parent=ss["Normal"], fontName="Helvetica", fontSize=7.5, leading=9.5,
+                          textColor=colors.HexColor("#1E293B"))
+    head = ParagraphStyle("head", parent=cell, fontName="Helvetica-Bold", textColor=colors.white)
+    h1 = ParagraphStyle("h1", parent=ss["Heading1"], textColor=blue, fontSize=20, spaceAfter=4)
+    h2 = ParagraphStyle("h2", parent=ss["Heading2"], textColor=navy, fontSize=13, spaceBefore=12, spaceAfter=6)
+    sub = ParagraphStyle("sub", parent=cell, fontSize=9, textColor=colors.HexColor("#" + SLATE))
+    conf_bg = {"High": "#DCFCE7", "Medium": "#FEF3C7", "Low": "#FEE2E2", "Not Found": "#E2E8F0"}
 
+    def p(txt):
+        return Paragraph(xesc(str(txt)).replace("\n", "<br/>"), cell)
 
-def _inject_css():
-    st.markdown("""
-    <style>
-      .stApp { background: #FFFFFF; }
+    def tbl(cols, rows, widths):
+        data = [[Paragraph(xesc(c), head) for c in cols]]
+        for r in rows:
+            line = []
+            for c in cols:
+                v = str(r[c])
+                if c == "Source" and v.startswith("http"):
+                    line.append(Paragraph(f'<link href="{xesc(v, {chr(34): "&quot;"})}" color="#{BLUE}">'
+                                          f'{xesc(_domain_of(v))}</link>', cell))
+                else:
+                    line.append(p(v))
+            data.append(line)
+        t = Table(data, colWidths=[w * mm for w in widths], repeatRows=1)
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), navy), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#" + LINE)),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#" + ZEBRA)]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
+        if "Confidence" in cols:
+            ci = cols.index("Confidence")
+            for i, r in enumerate(rows, 1):
+                if r["Confidence"] in conf_bg:
+                    style.append(("BACKGROUND", (ci, i), (ci, i), colors.HexColor(conf_bg[r["Confidence"]])))
+        t.setStyle(TableStyle(style))
+        return t
 
-      section[data-testid="stSidebar"] {
-        background: #F8FAFC;
-        border-right: 1px solid #E2E8F0;
-      }
+    def footer(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor("#" + SLATE))
+        canvas.drawString(12 * mm, 7 * mm, "UBTI Contact Intelligence")
+        canvas.drawRightString(285 * mm, 7 * mm, f"Page {doc_.page}")
+        canvas.restoreState()
 
-      h1, h2, h3 { color: #0369A1 !important; font-weight: 600 !important; }
-
-      .brand-header {
-        display: flex; align-items: center; gap: 12px;
-        padding: 0.6rem 0 0.8rem 0;
-        border-bottom: 2px solid #0EA5E9;
-        margin-bottom: 1.2rem;
-      }
-      .brand-header .brand-icon {
-        width: 38px; height: 38px; border-radius: 10px;
-        background: linear-gradient(135deg, #0EA5E9, #0369A1);
-        display: flex; align-items: center; justify-content: center;
-        color: #fff; font-size: 20px; font-weight: 700;
-        flex-shrink: 0;
-      }
-      .brand-header .brand-text {
-        font-size: 22px; font-weight: 700; color: #0369A1;
-        letter-spacing: -0.3px;
-      }
-      .brand-header .brand-sub {
-        font-size: 13px; color: #64748B; font-weight: 400;
-      }
-
-      .stTextArea textarea, .stTextInput input {
-        border-radius: 12px !important;
-        border: 1px solid #CBD5E1 !important;
-        font-size: 14px !important;
-      }
-      .stTextArea textarea:focus, .stTextInput input:focus {
-        border-color: #0EA5E9 !important;
-        box-shadow: 0 0 0 3px rgba(14,165,233,0.12) !important;
-      }
-
-      .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #0EA5E9, #0369A1);
-        color: white; border: none; border-radius: 10px;
-        padding: 0.55rem 1.4rem; font-weight: 600;
-        font-size: 15px; transition: all .15s ease;
-      }
-      .stButton > button[kind="primary"]:hover {
-        background: linear-gradient(135deg, #0369A1, #024a73);
-        transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(3,105,161,0.25);
-      }
-
-      .upload-hint {
-        font-size: 12px; color: #94A3B8;
-        margin: 0.3rem 0 0 0; line-height: 1.4;
-      }
-
-      .results-card {
-        background: #F8FAFC;
-        border: 1px solid #E2E8F0;
-        border-radius: 14px;
-        padding: 1rem 1.2rem;
-        margin: 0.8rem 0;
-      }
-
-      .conf-pill {
-        display: inline-block; padding: 2px 10px;
-        border-radius: 12px; font-size: 12px; font-weight: 500;
-      }
-      .conf-high { background: #DCFCE7; color: #166534; }
-
-      #MainMenu { visibility: hidden; }
-      footer { visibility: hidden; }
-      header[data-testid="stHeader"] { background: transparent; }
-    </style>
-    """, unsafe_allow_html=True)
+    n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm,
+                            topMargin=12 * mm, bottomMargin=14 * mm, title="Contact Intelligence Report")
+    story = [
+        Paragraph("Contact Intelligence Report", h1),
+        Paragraph(f"{len(people)} contacts · {n_high} high confidence · {len(companies)} companies · "
+                  f"{elapsed}s research time", sub),
+        Paragraph("People", h2),
+        tbl(PEOPLE_COLS, people_rows(people), [9, 32, 42, 34, 24, 20, 18, 58, 36]),
+    ]
+    if companies:
+        story += [Spacer(1, 6), Paragraph("Companies", h2),
+                  tbl(COMPANY_COLS, company_rows(companies), [38, 34, 32, 36, 22, 34, 77])]
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
 
 
-# ======================================================================================
-# SECTION 9 — UI helpers
-# ======================================================================================
-
-def _render_people_table(people: list[dict]):
-    rows = []
-    for idx, x in enumerate(people, 1):
-        p, c = x["profile"], x["contact"]
-        rows.append({
-            "S.No": idx,
-            "Name": p.get("full_name") or c["name_guess"],
-            "Title": p.get("current_title") or "—",
-            "Department": p.get("department") or "—",
-            "AI Relevance": p.get("ai_relevance") or "—",
-            "Notes": p.get("notes") or "—",
-            "Confidence": (p.get("confidence") or "").replace("_", " ").title(),
-            "Source": _best_source(x) or "—",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-
-def _image_bytes(img) -> tuple[bytes, str]:
-    """Convert any image input (PIL Image, bytes, UploadedFile) to (bytes, mime)."""
-    if isinstance(img, (bytes, bytearray)):
-        return bytes(img), "image/png"
-    if hasattr(img, "save") and not hasattr(img, "read"):
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue(), "image/png"
-    try:
-        data = img.getvalue()
-    except Exception:
-        img.seek(0)
-        data = img.read()
-    mime = getattr(img, "type", None) or "image/png"
-    return data, mime
+def build_files(result: dict) -> dict[str, bytes | None]:
+    people, companies, el = result["people"], result["companies"], result.get("elapsed", 0)
+    out: dict[str, bytes | None] = {}
+    for key, fn in (("pdf", lambda: to_pdf(people, companies, el)),
+                    ("docx", lambda: to_docx(people, companies, el)),
+                    ("xlsx", lambda: to_xlsx(people, companies))):
+        try:
+            out[key] = fn()
+        except Exception as e:
+            log.warning("export %s failed: %s", key, e)
+            out[key] = None
+    return out
 
 
 # ======================================================================================
-# SECTION 10 — Main app
+# SECTION 8 — Theme + generative UI components
 # ======================================================================================
 
-def main():
-    _inject_css()
+CSS = """
+<style>
+:root{--navy:#0F172A;--ink:#1E293B;--muted:#64748B;--line:#E2E8F0;--bg:#F8FAFC;--accent:#1F4FD8;}
+html,body,[class*="css"]{font-family:'Inter','Segoe UI',system-ui,sans-serif;}
+#MainMenu,footer{visibility:hidden;}
+.block-container{max-width:1080px;padding-top:2rem;padding-bottom:7rem;}
 
-    # ── Sidebar ──
+/* sidebar */
+[data-testid="stSidebar"]{background:var(--navy);border-right:1px solid #1E293B;}
+[data-testid="stSidebar"] *{color:#CBD5E1;}
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#F8FAFC;}
+[data-testid="stSidebar"] .stButton>button{background:transparent;border:1px solid transparent;
+  color:#E2E8F0;justify-content:flex-start;text-align:left;border-radius:8px;padding:.45rem .7rem;font-weight:400;}
+[data-testid="stSidebar"] .stButton>button:hover{background:#1E293B;border-color:#1E293B;}
+[data-testid="stSidebar"] .stButton>button[kind="primary"]{background:#1E293B;border-color:#334155;}
+[data-testid="stSidebar"] .stButton>button.newchat,[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"]{}
+[data-testid="stSidebar"] input,[data-testid="stSidebar"] textarea{background:#1E293B!important;color:#F1F5F9!important;border-color:#334155!important;}
+[data-testid="stSidebar"] hr{border-color:#1E293B;}
+.brand{font-weight:700;font-size:1.05rem;color:#F8FAFC;letter-spacing:.2px;margin-bottom:.2rem;}
+.brand b{color:#60A5FA;}
+.side-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#64748B;margin:.9rem 0 .3rem;}
+
+/* chat */
+[data-testid="stChatMessage"]{background:transparent;padding:.6rem 0;}
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]){background:#F1F5F9;border-radius:14px;padding:.7rem 1rem;}
+[data-testid="stChatInput"]{border:1px solid var(--line);border-radius:16px;box-shadow:0 2px 12px rgba(15,23,42,.08);}
+[data-testid="stChatInput"]:focus-within{border-color:var(--accent);}
+
+/* welcome */
+.hero{text-align:center;margin:12vh 0 1.5rem;}
+.hero h1{font-size:2rem;font-weight:700;color:var(--navy);margin:0;}
+.hero p{color:var(--muted);margin-top:.5rem;}
+
+/* KPI cards */
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:.4rem 0 1rem;}
+.kpi{border:1px solid var(--line);border-radius:12px;padding:.7rem .9rem;background:#fff;}
+.kpi .v{font-size:1.5rem;font-weight:700;color:var(--navy);line-height:1.1;}
+.kpi .l{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-top:.2rem;}
+.kpi.accent{border-left:4px solid var(--accent);}
+
+/* generated tables */
+.gt-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:#fff;}
+table.gt{width:100%;border-collapse:collapse;font-size:.84rem;}
+table.gt th{background:var(--navy);color:#fff;text-align:left;padding:.6rem .7rem;font-weight:600;white-space:nowrap;position:sticky;top:0;}
+table.gt td{padding:.55rem .7rem;border-top:1px solid var(--line);vertical-align:top;color:var(--ink);}
+table.gt tr:nth-child(even) td{background:var(--bg);}
+table.gt tr:hover td{background:#EFF6FF;}
+table.gt a{color:var(--accent);text-decoration:none;font-weight:500;}
+table.gt a:hover{text-decoration:underline;}
+.bd{display:inline-block;padding:.12rem .55rem;border-radius:999px;font-size:.72rem;font-weight:600;white-space:nowrap;}
+.bd-ok{background:#DCFCE7;color:#166534;} .bd-warn{background:#FEF3C7;color:#92400E;}
+.bd-bad{background:#FEE2E2;color:#991B1B;} .bd-na{background:#E2E8F0;color:#475569;}
+.bd-vh{background:#1E3A8A;color:#fff;} .bd-h{background:#DBEAFE;color:#1E40AF;}
+.bd-m{background:#E2E8F0;color:#334155;} .bd-l{background:#F1F5F9;color:#64748B;}
+.muted{color:var(--muted);} .dl-title{font-size:.8rem;color:var(--muted);margin:1rem 0 .3rem;}
+.detail p{margin:.15rem 0;font-size:.88rem;}
+</style>
+"""
+
+CONF_CLS = {"High": "ok", "Medium": "warn", "Low": "bad", "Not Found": "na"}
+AI_CLS = {"Very High": "vh", "High": "h", "Medium": "m", "Low": "l"}
+
+
+def _cell_html(col: str, v: str) -> str:
+    if not v:
+        return '<span class="muted">—</span>'
+    if col == "Confidence":
+        return f'<span class="bd bd-{CONF_CLS.get(v, "na")}">{esc(v)}</span>'
+    if col == "AI Relevance":
+        return f'<span class="bd bd-{AI_CLS.get(v, "m")}">{esc(v)}</span>'
+    if col == "Source":
+        if v.startswith("http"):
+            return f'<a href="{esc(v)}" target="_blank" rel="noopener">{esc(_domain_of(v))} ↗</a>'
+        return '<span class="muted">—</span>'
+    if col == "Name":
+        return f"<b>{esc(v)}</b>"
+    return esc(v).replace("\n", "<br>")
+
+
+def table_html(cols: list[str], rows: list[dict]) -> str:
+    head = "".join(f"<th>{esc(c)}</th>" for c in cols)
+    body = "".join("<tr>" + "".join(f"<td>{_cell_html(c, str(r[c]))}</td>" for c in cols) + "</tr>"
+                   for r in rows)
+    return f'<div class="gt-wrap"><table class="gt"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def kpi_html(people: list[dict], companies: dict, elapsed: float) -> str:
+    n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
+    items = [(len(people), "Contacts", True), (n_high, "High confidence", False),
+             (len(companies), "Companies", False), (f"{elapsed}s", "Research time", False)]
+    return '<div class="kpis">' + "".join(
+        f'<div class="kpi{" accent" if a else ""}"><div class="v">{v}</div><div class="l">{l}</div></div>'
+        for v, l, a in items) + "</div>"
+
+
+def detail_html(x: dict) -> str:
+    p = x["profile"]
+    parts = []
+    for label, key in (("Summary", "summary"), ("Location", "location"), ("Why this match", "match_reasoning")):
+        if p.get(key):
+            parts.append(f"<p><b>{label}:</b> {esc(p[key])}</p>")
+    if p.get("previous_roles"):
+        roles = "; ".join(" · ".join(filter(None, (r["title"], r["company"], r["period"])))
+                          for r in p["previous_roles"])
+        parts.append(f"<p><b>Previous roles:</b> {esc(roles)}</p>")
+    if p.get("linkedin_url", "").startswith("http"):
+        parts.append(f'<p><b>LinkedIn:</b> <a href="{esc(p["linkedin_url"])}" target="_blank">'
+                     f'{esc(_domain_of(p["linkedin_url"]))} ↗</a></p>')
+    if p.get("sources"):
+        links = " · ".join(f'<a href="{esc(u)}" target="_blank">{esc(_domain_of(u))}</a>' for u in p["sources"][:6])
+        parts.append(f"<p><b>Sources:</b> {links}</p>")
+    if p.get("_error"):
+        parts.append(f"<p>⚠ {esc(p['_error'])}</p>")
+    return '<div class="detail">' + ("".join(parts) or '<p class="muted">No further details found.</p>') + "</div>"
+
+
+def render_result(msg: dict, mid: str) -> None:
+    res = msg["result"]
+    people, companies = res["people"], res["companies"]
+    st.markdown(kpi_html(people, companies, res.get("elapsed", 0)), unsafe_allow_html=True)
+
+    tabs = st.tabs(["People", "Companies", "Details"] if companies else ["People", "Details"])
+    with tabs[0]:
+        st.markdown(table_html(PEOPLE_COLS, people_rows(people)), unsafe_allow_html=True)
+    if companies:
+        with tabs[1]:
+            st.markdown(table_html(COMPANY_COLS, company_rows(companies)), unsafe_allow_html=True)
+    with tabs[-1]:
+        for x in people:
+            p = x["profile"]
+            title = " — ".join(filter(None, (p.get("full_name") or x["contact"]["name_guess"],
+                                             p.get("current_title"))))
+            with st.expander(title or x["contact"]["email"]):
+                st.markdown(detail_html(x), unsafe_allow_html=True)
+
+    for n in res.get("notes") or []:
+        st.caption(f"ℹ {n}")
+
+    files = msg.get("files") or {}
+    st.markdown('<div class="dl-title">Download report</div>', unsafe_allow_html=True)
+    c1, c2, c3, _ = st.columns([1, 1, 1, 2])
+    specs = [(c1, "pdf", "PDF", "contact_intelligence.pdf", "application/pdf"),
+             (c2, "docx", "Word", "contact_intelligence.docx",
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+             (c3, "xlsx", "Excel", "contact_intelligence.xlsx",
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")]
+    for col, key, label, fname, mime in specs:
+        with col:
+            if files.get(key):
+                st.download_button(f"⬇ {label}", files[key], file_name=fname, mime=mime,
+                                   key=f"dl_{mid}_{key}", use_container_width=True)
+            else:
+                st.caption(f"{label} unavailable")
+
+
+# ======================================================================================
+# SECTION 9 — Chat state + app
+# ======================================================================================
+
+SUGGESTIONS = [
+    "Ganesh R <ganesh.r@ak.com.sa>\nVenkatesh M <venkatesh.m@ak.com.sa>",
+    "Jane Doe <jane.doe@acme.com>; John Smith <john.smith@acme.com>",
+]
+
+
+def _new_chat() -> None:
+    cid = uuid.uuid4().hex[:8]
+    st.session_state.chats[cid] = {"title": "New chat", "messages": []}
+    st.session_state.order.insert(0, cid)
+    st.session_state.current = cid
+
+
+def _init_state() -> None:
+    ss = st.session_state
+    ss.setdefault("chats", {})
+    ss.setdefault("order", [])
+    ss.setdefault("pending", None)
+    if not ss.get("current") or ss.current not in ss.chats:
+        _new_chat()
+
+
+def _set_pending(text: str) -> None:
+    st.session_state.pending = text
+
+
+def _select(cid: str) -> None:
+    st.session_state.current = cid
+
+
+def render_message(m: dict, mid: str) -> None:
+    avatar = ":material/person:" if m["role"] == "user" else ":material/hub:"
+    with st.chat_message(m["role"], avatar=avatar):
+        if m.get("text"):
+            st.markdown(m["text"])
+        for img in m.get("images") or []:
+            st.image(img, width=200)
+        if m.get("result"):
+            render_result(m, mid)
+
+
+def process(text: str, files: list, hint: str, include_sender: bool, force: bool) -> dict:
+    contacts: list[Contact] = []
+    seen: set[str] = set()
+
+    def add(items: list[Contact]) -> None:
+        for c in items:
+            if c.email not in seen:
+                seen.add(c.email)
+                contacts.append(c)
+
+    with st.status("Reading your input…", expanded=True) as status:
+        try:
+            if text.strip():
+                add(smart_parse(text, S, hint, include_sender))
+            for f in files:
+                status.update(label=f"Reading image {getattr(f, 'name', '')}…")
+                add(contacts_from_image(f.getvalue(), S, getattr(f, "type", None) or "image/png"))
+        except Exception as e:
+            log.warning("parse failed: %s", e)
+            status.update(label="Could not read the input", state="error")
+            return {"role": "assistant", "text": "I couldn't read that input. Please check your Azure settings and try again."}
+
+        if not contacts:
+            status.update(label="No contacts found", state="error")
+            return {"role": "assistant", "text": (
+                "I couldn't find any email addresses. Send a pasted email header, a list like "
+                "`Name <email@company.com>`, or a screenshot that shows email addresses.")}
+
+        truncated = len(contacts) > S.max_contacts
+        contacts = contacts[:S.max_contacts]
+        n_dom = len({c.domain for c in contacts})
+        status.update(label=f"Researching {len(contacts)} contact(s) across {n_dom} domain(s)…")
+        bar = st.progress(0.0)
+        result = None
+        for ev in run_lookup(contacts, hint, S, force=force):
+            if ev["type"] == "progress":
+                bar.progress(ev["done"] / max(ev["total"], 1))
+                st.write(f"• {ev['message']}")
+            else:
+                result = ev["data"]
+        status.update(label=f"Research complete in {result['elapsed']}s", state="complete", expanded=False)
+
+    confs = [x["profile"]["confidence"] for x in result["people"]]
+    summary = (f"I researched **{len(contacts)}** contact(s) across **{len(result['companies'])}** "
+               f"company profile(s): **{confs.count('high')}** high, **{confs.count('medium')}** medium, "
+               f"**{confs.count('low') + confs.count('not_found')}** need review.")
+    if truncated:
+        summary += f" Only the first {S.max_contacts} contacts were processed."
+    return {"role": "assistant", "text": summary, "result": result, "files": build_files(result)}
+
+
+def main() -> None:
+    st.markdown(CSS, unsafe_allow_html=True)
+    _init_state()
+    ss = st.session_state
+
+    # ---------------- Sidebar ----------------
     with st.sidebar:
-        st.markdown("""
-        <div style="text-align:center; padding: 1rem 0 0.6rem 0;">
-            <div style="font-size:22px; font-weight:700; color:#0369A1;">
-                🌐 Unlimited Innovations
-            </div>
-            <div style="font-size:13px; color:#64748B; margin-top:2px;">
-                Contact Intelligence
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.divider()
-
-        if st.button("🔄  New Search", use_container_width=True, type="primary"):
-            st.session_state.pop("result", None)
+        st.markdown('<div class="brand">◆ UBTI <b>Contact Intelligence</b></div>', unsafe_allow_html=True)
+        if st.button("＋  New chat", use_container_width=True, key="new_chat"):
+            _new_chat()
             st.rerun()
 
-        if st.button("🗑️  Clear History", use_container_width=True):
-            SEARCH_CACHE._d.clear()
-            PROFILE_CACHE._d.clear()
-            st.session_state.pop("result", None)
-            st.success("History cleared!")
+        st.markdown('<div class="side-label">Chats</div>', unsafe_allow_html=True)
+        for cid in ss.order:
+            st.button(ss.chats[cid]["title"][:30], key=f"chat_{cid}", use_container_width=True,
+                      type="primary" if cid == ss.current else "secondary",
+                      on_click=_select, args=(cid,))
 
-        st.divider()
-        st.markdown("##### Options")
-        inc_sender = st.checkbox("Include sender (From field)", value=True, key="opt_sender")
-        bypass_cache = st.checkbox("Fresh search (ignore saved)", key="opt_fresh")
+        st.markdown('<div class="side-label">Settings</div>', unsafe_allow_html=True)
+        hint = st.text_input("Company / context hint", placeholder="e.g. Al Abdul Karim, Saudi Arabia")
+        include_sender = st.checkbox("Include email sender (From)", value=False)
+        force = st.checkbox("Bypass cache (re-research)", value=False)
 
-        st.divider()
-        st.caption("Powered by AI · Unlimited Innovations India Pvt. Ltd.")
-
-    # ── Top branding ──
-    st.markdown("""
-    <div class="brand-header">
-        <div class="brand-icon">UI</div>
-        <div>
-            <div class="brand-text">Unlimited Innovations</div>
-            <div class="brand-sub">AI-Powered Contact Intelligence</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Greeting ──
-    if "result" not in st.session_state:
-        st.markdown("### 👋 How can I help you today?")
-        st.write("Paste an email, a list of contacts, or drop a screenshot — I'll find their profiles.")
-
-    if not S.ready:
-        st.error("The system is not configured yet. Please contact your administrator.")
-        st.stop()
-
-    # ── Input area ──
-    with st.container():
-        col_main, col_img = st.columns([3, 1.2])
-
-        with col_main:
-            raw_text = st.text_area(
-                "Paste email headers, names, or contact info here…",
-                height=130,
-                placeholder="e.g. Jane Doe <jane@acme.com>, John Smith <john@example.org>",
-                label_visibility="collapsed",
-            )
-            context_hint = st.text_input(
-                "Company or context (optional)",
-                placeholder="e.g. Acme Corp — helps improve accuracy",
-                label_visibility="collapsed",
-            )
-
-        with col_img:
-            st.markdown("**📎 Image Input**")
-            pasted_image = None
-
-            if _HAS_PASTE_BTN:
-                res = pbutton(
-                    "📋 Paste from clipboard",
-                    text_color="#ffffff",
-                    background_color=CRYSTAL,
-                    hover_background_color=DEEP,
-                    errors="ignore",
-                    key="paste_btn",
-                )
-                if res and res.image_data is not None:
-                    pasted_image = res.image_data
-                    st.image(pasted_image, width=120, caption="Pasted image")
-
-            uploaded = st.file_uploader(
-                "Or upload images",
-                type=["png", "jpg", "jpeg", "webp"],
-                accept_multiple_files=True,
-                label_visibility="collapsed",
-            )
-            st.markdown('<p class="upload-hint">Screenshots, business cards, meeting invites, '
-                        'or any image with contact info.</p>', unsafe_allow_html=True)
-
-    # ── Send button ──
-    can_run = bool(raw_text.strip()) or pasted_image is not None or bool(uploaded)
-
-    if st.button("🔍  Find Contacts", type="primary", disabled=not can_run, use_container_width=True):
-        all_contacts: list[Contact] = []
-        seen: set[str] = set()
-
-        if raw_text.strip():
-            with st.spinner("Reading your text…"):
-                try:
-                    tc, _ = smart_parse(raw_text, S, context_hint, inc_sender)
-                except Exception:
-                    tc = []
-                for c in tc:
-                    if c.email not in seen:
-                        seen.add(c.email)
-                        all_contacts.append(c)
-
-        if pasted_image is not None:
-            with st.spinner("Reading pasted image…"):
-                data, mime = _image_bytes(pasted_image)
-                try:
-                    ic, _ = contacts_from_image(data, S, mime, inc_sender)
-                except Exception:
-                    ic = []
-                for c in ic:
-                    if c.email not in seen:
-                        seen.add(c.email)
-                        all_contacts.append(c)
-
-        for img in uploaded or []:
-            with st.spinner(f"Reading {img.name}…"):
-                data, mime = _image_bytes(img)
-                try:
-                    ic, _ = contacts_from_image(data, S, mime, inc_sender)
-                except Exception:
-                    ic = []
-                for c in ic:
-                    if c.email not in seen:
-                        seen.add(c.email)
-                        all_contacts.append(c)
-
-        all_contacts = all_contacts[:S.max_contacts]
-
-        if not all_contacts:
-            st.warning("No contacts found. Try pasting email headers or uploading a clearer image.")
+        st.markdown('<div class="side-label">Status</div>', unsafe_allow_html=True)
+        if S.ready:
+            st.caption("● APIs configured")
         else:
-            st.info(f"Found {len(all_contacts)} contact(s). Researching now…")
-            progress = st.progress(0.0, text="Starting…")
-            result = None
-            for event in run_lookup(all_contacts, context_hint, S, force=bypass_cache):
-                if event["type"] == "progress":
-                    pct = event["done"] / max(event["total"], 1)
-                    progress.progress(pct, text=event["message"])
-                elif event["type"] == "result":
-                    result = event["data"]
-            progress.empty()
-            if result:
-                st.session_state["result"] = result
+            miss = ([] if S.has_azure else ["AZURE_OPENAI_ENDPOINT / API_KEY / DEPLOYMENT"]) + \
+                   ([] if S.has_tavily else ["TAVILY_API_KEY"])
+            st.error("Missing: " + ", ".join(miss))
+        st.caption(f"Engine: {S.engine_label}")
+        if st.button("Clear caches", use_container_width=True):
+            SEARCH_CACHE.clear()
+            PROFILE_CACHE.clear()
+            st.toast("Caches cleared")
 
-    # ── Results ──
-    result = st.session_state.get("result")
-    if not result:
+    chat = ss.chats[ss.current]
+    msgs = chat["messages"]
+
+    # ---------------- Conversation ----------------
+    if not msgs:
+        st.markdown('<div class="hero"><h1>Who would you like to research?</h1>'
+                    '<p>Paste an email header, a list of contacts, or attach a screenshot.</p></div>',
+                    unsafe_allow_html=True)
+        cols = st.columns(len(SUGGESTIONS))
+        for col, s_ in zip(cols, SUGGESTIONS):
+            with col:
+                st.button(s_.replace("\n", " · ")[:70], key=f"sug_{hash(s_)}", use_container_width=True,
+                          on_click=_set_pending, args=(s_,))
+    for i, m in enumerate(msgs):
+        render_message(m, f"{ss.current}_{i}")
+
+    # ---------------- Input ----------------
+    fallback_files: list = []
+    try:
+        val = st.chat_input("Paste contacts or a screenshot (Ctrl+V), or attach images…",
+                            accept_file="multiple", file_type=["png", "jpg", "jpeg", "webp"])
+    except TypeError:  # Streamlit < 1.43
+        with st.sidebar:
+            fallback_files = st.file_uploader("Screenshots", type=["png", "jpg", "jpeg", "webp"],
+                                              accept_multiple_files=True) or []
+        val = st.chat_input("Paste contacts here…")
+
+    text, files = "", list(fallback_files)
+    if isinstance(val, str):
+        text = val
+    elif val:
+        text = getattr(val, "text", "") or ""
+        files = list(getattr(val, "files", None) or [])
+    if ss.pending:
+        text, ss.pending = ss.pending, None
+    if not (text.strip() or (files and val)):
+        return
+    if not S.ready:
+        st.error("Configure API keys in .env first.")
         return
 
-    st.divider()
-
-    people, companies = result["people"], result["companies"]
-    n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
-
-    st.markdown(f"""
-    <div class="results-card">
-        <div style="font-size:18px; font-weight:600; color:#0369A1; margin-bottom:6px;">
-            ✅ Research Complete
-        </div>
-        <div style="color:#475569; font-size:14px;">
-            <strong>{len(people)}</strong> contacts found
-            · <span class="conf-pill conf-high">{n_high} high confidence</span>
-            · {len(companies)} companies
-            · completed in {result['elapsed']}s
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("#### 👥 Contacts")
-    _render_people_table(people)
-
-    if companies:
-        with st.expander("🏢 Company Profiles"):
-            st.dataframe(_build_company_df(companies), use_container_width=True, hide_index=True)
-
-    if result.get("notes"):
-        with st.expander("📝 Notes"):
-            for n in result["notes"]:
-                st.write(f"• {n}")
-
-    st.markdown("#### 📥 Download Results")
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        st.download_button("📄 CSV", data=to_csv(people, companies),
-                           file_name="contacts.csv", mime="text/csv",
-                           use_container_width=True)
-    with d2:
-        try:
-            st.download_button("📊 Excel", data=to_xlsx(people, companies),
-                               file_name="contacts.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
-        except Exception as e:
-            st.caption(f"Unavailable: {e}")
-    with d3:
-        try:
-            st.download_button("📝 Word", data=to_docx(people, companies, result.get("elapsed", 0)),
-                               file_name="contacts.docx",
-                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                               use_container_width=True)
-        except Exception as e:
-            st.caption(f"Unavailable: {e}")
+    images = [f.getvalue() for f in files]
+    msgs.append({"role": "user", "text": f"```\n{text.strip()}\n```" if text.strip() else "", "images": images})
+    if chat["title"] == "New chat":
+        m = EMAIL_RE.search(text)
+        chat["title"] = (m.group(0) if m else text.strip().splitlines()[0][:30]) if text.strip() else "Screenshot lookup"
+    render_message(msgs[-1], "tmp")
+    with st.chat_message("assistant", avatar=":material/hub:"):
+        reply = process(text, files, hint, include_sender, force)
+    msgs.append(reply)
+    st.rerun()
 
 
 if __name__ == "__main__":
