@@ -15,7 +15,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from html import escape as esc
 from typing import Iterator
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 from xml.sax.saxutils import escape as xesc
 
 import requests
@@ -27,8 +27,8 @@ load_dotenv()
 
 # Theme set in code (replaces .streamlit/config.toml). Must run before set_page_config.
 for _k, _v in {
-    "theme.base": "light", "theme.primaryColor": "#6A41E0", "theme.backgroundColor": "#FFFFFF",
-    "theme.secondaryBackgroundColor": "#F1F5F9", "theme.textColor": "#1F1B3A",
+    "theme.base": "light", "theme.primaryColor": "#1D5FD6", "theme.backgroundColor": "#FFFFFF",
+    "theme.secondaryBackgroundColor": "#F1F5F9", "theme.textColor": "#14213D",
     "browser.gatherUsageStats": False,
 }.items():
     try:
@@ -358,7 +358,7 @@ def tavily_search(s: Settings, query: str, include_domains: tuple[str, ...] | No
             continue
         break
     r.raise_for_status()
-    out = [{"title": x.get("title", ""), "url": x.get("url", ""), "content": (x.get("content") or "")[:700]}
+    out = [{"title": x.get("title", ""), "url": x.get("url", ""), "content": (x.get("content") or "")[:1200 if "linkedin.com/in/" in x.get("url", "") else 700]}
            for x in r.json().get("results", []) if x.get("url")]
     SEARCH_CACHE.set(key, out)
     return out
@@ -447,6 +447,15 @@ SYSTEM_RULES = (
     "Matching rules: display name and email local part must fit the person. "
     "A profile at a related group company is a valid match; explain the link in match_reasoning. "
     "Sources must be URLs from the evidence. Return a single JSON object only.\n\n"
+    "CURRENT ROLE rules (critical):\n"
+    "- current_title and current_company must be the role the person holds TODAY. LinkedIn is the highest-priority "
+    "source: a LinkedIn headline or an Experience entry marked 'Present' beats every other source.\n"
+    "- If several roles are listed, pick the one marked Present or with the latest start date. Roles with an end "
+    "date, or described in the past tense, go ONLY in previous_roles - never in current_title.\n"
+    "- Never guess a title from seniority or tenure. If the evidence does not show a current title, return \"\" "
+    "and confidence 'low'.\n"
+    "- linkedin_url must be a linkedin.com/in/ URL that appears in the evidence for THIS person.\n"
+    "- When sources disagree, trust LinkedIn, then the most recent dated source.\n\n"
     "DEPARTMENT & AI RELEVANCE rules:\n"
     "- department: infer from title (CTO -> IT, CFO -> Finance, CHRO -> HR, COO -> Operations, "
     "CMO -> Marketing, CEO/MD -> Executive Leadership).\n"
@@ -456,12 +465,13 @@ SYSTEM_RULES = (
 )
 
 PLAYBOOK = """Research playbook:
-1. Search "<display name>" + company; "<display name>" + email domain.
-2. If surname is an initial, find full surname via first name + company + senior title.
-3. Check linkedin, zoominfo, rocketreach, theorg, contactout, crunchbase, apollo.
-4. Check related companies (subsidiary, parent, sister brands, previous employers).
-5. Look for press, interviews, event-speaker pages.
-Stop once title and company are corroborated by at least one source."""
+1. LinkedIn FIRST: search "<display name>" + company on linkedin.com and read the headline and current position.
+2. Then search "<display name>" + company; "<display name>" + email domain.
+3. If surname is an initial, find full surname via first name + company + senior title.
+4. Check zoominfo, rocketreach, theorg, contactout, crunchbase, apollo to corroborate.
+5. Check related companies (subsidiary, parent, sister brands, previous employers).
+6. Look for press, interviews, event-speaker pages.
+Stop once the CURRENT title and company are corroborated, preferably by LinkedIn."""
 
 
 def company_task(domain: str, hint: str) -> str:
@@ -491,6 +501,16 @@ def person_task(c: Contact, company: dict, all_companies: dict) -> str:
 # SECTION 5 — Evidence handling + normalisation
 # ======================================================================================
 
+def clean_linkedin(u: str) -> str:
+    """Canonical https://www.linkedin.com/in/<slug>, or '' if not a profile URL (fixes country sub-domains)."""
+    m = re.match(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/([^/?#\s]+)", (u or "").strip(), re.I)
+    return f"https://www.linkedin.com/in/{m.group(1)}" if m else ""
+
+
+def linkedin_search_url(name: str, company: str = "") -> str:
+    return "https://www.linkedin.com/search/results/people/?keywords=" + quote_plus(f"{name} {company}".strip())
+
+
 def _norm_url(u: str) -> str:
     return re.sub(r"^https?://(www\.)?", "", (u or "").strip().lower()).rstrip("/")
 
@@ -503,7 +523,7 @@ def _rank(results: list[dict], tokens: list[str], keep: int = 14) -> list[dict]:
 
     def score(r: dict) -> int:
         blob = f"{r.get('title', '')} {r.get('content', '')} {r['url']}".lower()
-        return sum(blob.count(t) for t in toks)
+        return sum(blob.count(t) for t in toks) + (40 if "linkedin.com/in/" in r["url"] else 0)
 
     return sorted(seen.values(), key=score, reverse=True)[:keep]
 
@@ -551,17 +571,44 @@ def normalize_person(d: dict, c: Contact, allowed: set[str]) -> dict:
             x for x in (_s(ap.get("city")), _s(ap.get("country"))) if x)
         if _s(ap.get("linkedin_url")):
             allowed = allowed | {_norm_url(ap["linkedin_url"])}
-    if out["linkedin_url"] and _norm_url(out["linkedin_url"]) not in allowed:
-        out["linkedin_url"] = ""
+    allowed_li = {_norm_url(clean_linkedin("https://" + a)) for a in allowed if "linkedin.com/in/" in a}
+    li = clean_linkedin(out["linkedin_url"])
+    out["linkedin_url"] = li if li and _norm_url(li) in allowed_li else ""
     conf = _s(d.get("confidence")).lower().replace(" ", "_")
     if conf not in CONFIDENCE:
         conf = "low" if out["current_title"] else "not_found"
     if conf == "high" and not (out["current_title"] and out["current_company"]):
         conf = "medium"
+    srcs: list[str] = []
+    for u in _urls(d.get("sources")):
+        lu = clean_linkedin(u)
+        if lu and _norm_url(lu) in allowed_li:
+            srcs.append(lu)
+        elif _norm_url(u) in allowed:
+            srcs.append(u)
+    if out["linkedin_url"]:
+        srcs.insert(0, out["linkedin_url"])
+    out["sources"] = sorted(dict.fromkeys(srcs), key=lambda u: "linkedin.com/in/" not in u)
+    if conf == "high" and not any("linkedin.com/in/" in u for u in out["sources"]):
+        conf = "medium"  # current title not corroborated by LinkedIn
     out["confidence"] = conf
     out["full_name"] = out["full_name"] or c.name_guess
-    out["sources"] = list(dict.fromkeys(u for u in _urls(d.get("sources")) if _norm_url(u) in allowed))
     return out
+
+
+def _ensure_linkedin(profile: dict, ev: list[dict], name: str) -> dict:
+    """If the model returned no LinkedIn URL, take the best matching LinkedIn result from the evidence."""
+    if profile.get("linkedin_url"):
+        return profile
+    toks = [t for t in re.findall(r"[a-z]+", name.lower()) if len(t) > 2][:2]
+    for r in ev if toks else []:
+        li = clean_linkedin(r["url"])
+        blob = f'{r.get("title", "")} {r.get("content", "")} {r["url"]}'.lower()
+        if li and all(t in blob for t in toks):
+            profile["linkedin_url"] = li
+            profile["sources"] = list(dict.fromkeys([li, *profile.get("sources", [])]))
+            break
+    return profile
 
 
 def _incomplete(p: dict) -> bool:
@@ -660,6 +707,7 @@ def _gap_queries(c: Contact, company: dict) -> list[tuple[str, tuple[str, ...] |
     co = company.get("company_name") or c.stem
     group = company.get("parent_or_group") or ""
     qs: list[tuple[str, tuple[str, ...] | None]] = [
+        (f'"{name}" {co}', ("linkedin.com",)),
         (f'"{name}" "{co}"', None),
         (f'"{name}" {co}', tuple(PEOPLE_SITES)),
         (f'{first} {co} CEO OR CTO OR CIO OR "Vice President" OR Director OR Head OR Manager', None),
@@ -681,7 +729,10 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
     name, stem = c.name_guess or c.local, c.stem
     hint_q = ([(f'"{name}" {c.company_hint}', None)]
               if c.company_hint and c.company_hint.lower() not in stem else [])
+    li_only = ("linkedin.com",)
     queries: list[tuple[str, tuple[str, ...] | None]] = [
+        (f'"{name}" {stem}', li_only),
+        (f"{name} {stem} current position experience", li_only),
         (f'"{name}" {stem}', None),
         (f'"{name}" {stem} linkedin', None),
         (f"{name} {c.domain}", None),
@@ -735,6 +786,7 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
                 "profile": _fallback_profile(c, "Lookup failed for this contact. Please retry."),
                 "_notes": notes}
 
+    profile = _ensure_linkedin(profile, ev, name)
     out = {"contact": _public(c), "profile": profile, "_notes": notes}
     if profile["confidence"] != "not_found":
         PROFILE_CACHE.set(pkey, out)
@@ -798,7 +850,7 @@ def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = Fa
 # SECTION 7 — Tabular model + exports (PDF / Word / Excel)
 # ======================================================================================
 
-NAVY, BLUE, SLATE, LINE, ZEBRA = "1E1747", "5B3FD6", "5B5880", "E6E3F5", "FBFAFF"
+NAVY, BLUE, SLATE, LINE, ZEBRA = "0A2A6B", "1D5FD6", "5B6B8C", "DCE5F5", "F6F9FF"
 
 PEOPLE_COLS = ["S.No", "Name", "Title", "Company", "Department", "AI Relevance",
                "Confidence", "Notes", "Source"]
@@ -807,12 +859,13 @@ COMPANY_COLS = ["Company", "Domain", "Industry", "Headquarters", "Size", "Parent
 
 
 def _best_source(item: dict) -> str:
+    """LinkedIn profile first, then any other source."""
     p = item.get("profile", {})
-    for u in p.get("sources") or []:
-        if u and u.startswith("http"):
-            return u
     li = p.get("linkedin_url", "")
-    return li if li.startswith("http") else ""
+    if li.startswith("http"):
+        return li
+    srcs = [u for u in p.get("sources") or [] if u and u.startswith("http")]
+    return next((u for u in srcs if "linkedin.com/in/" in u), srcs[0] if srcs else "")
 
 
 def _conf_label(c: str) -> str:
@@ -847,7 +900,8 @@ def company_rows(companies: dict[str, dict]) -> list[dict]:
 
 
 def _domain_of(url: str) -> str:
-    return (urlparse(url).netloc or url).removeprefix("www.")
+    host = (urlparse(url).netloc or url).removeprefix("www.")
+    return "LinkedIn" if host.endswith("linkedin.com") else host
 
 
 def to_xlsx(people: list[dict], companies: dict[str, dict]) -> bytes:
@@ -1081,60 +1135,61 @@ def build_files(result: dict) -> dict[str, bytes | None]:
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-:root{--deep:#150F33;--deep2:#1E1747;--ink:#1F1B3A;--muted:#6B6890;--line:#E6E3F5;--bg:#F7F5FF;
-  --accent:#6A41E0;--accent2:#8B5CF6;--accent-soft:#F0EBFF;}
+:root{--deep:#0A2A6B;--deep2:#0F3A8F;--ink:#14213D;--muted:#5B6B8C;--line:#DCE5F5;--bg:#F4F8FF;
+  --accent:#1D5FD6;--accent2:#3B82F6;--accent-soft:#EAF1FF;}
 html,body,[class*="css"]{font-family:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;}
 #MainMenu,footer,[data-testid="stToolbar"],[data-testid="stDecoration"],[data-testid="stStatusWidget"]{display:none!important;}
 header[data-testid="stHeader"]{background:transparent;}
-[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,#F4F1FF 0%,#FFFFFF 380px);}
+[data-testid="stAppViewContainer"]{background:#FFFFFF;}
 .block-container{max-width:1100px;padding-top:2rem;padding-bottom:8rem;}
 
 /* ---------- sidebar: deep UBTI indigo ---------- */
-[data-testid="stSidebar"]{background:linear-gradient(180deg,var(--deep) 0%,#0E0A24 100%);border-right:0;}
-[data-testid="stSidebarCollapseButton"] svg,[data-testid="stSidebarCollapsedControl"] svg{color:#B9B1E6;}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,var(--deep) 0%,#071E50 100%);border-right:0;}
+[data-testid="stSidebarCollapseButton"] svg,[data-testid="stSidebarCollapsedControl"] svg{color:#BFD3F7;}
 .logo{display:block;width:190px;margin:.4rem 0 1.6rem .3rem;}
-[data-testid="stSidebar"] .stButton>button{background:transparent;border:1px solid transparent;color:#D8D2F5;
+[data-testid="stSidebar"] .stButton>button{background:transparent;border:1px solid transparent;color:#DCE8FF;
   justify-content:flex-start;text-align:left;border-radius:10px;padding:.55rem .8rem;font-weight:500;font-size:.9rem;box-shadow:none;}
 [data-testid="stSidebar"] .stButton>button:hover{background:rgba(255,255,255,.07);color:#fff;border-color:transparent;}
-[data-testid="stSidebar"] .stButton>button[kind="primary"]{background:rgba(139,92,246,.20);color:#fff;border-color:rgba(139,92,246,.40);}
+[data-testid="stSidebar"] .stButton>button[kind="primary"]{background:rgba(59,130,246,.20);color:#fff;border-color:rgba(59,130,246,.40);}
 .st-key-new_chat button{background:linear-gradient(135deg,var(--accent),var(--accent2))!important;color:#fff!important;
-  font-weight:600!important;justify-content:center!important;border:0!important;box-shadow:0 6px 18px rgba(106,65,224,.35)!important;}
+  font-weight:600!important;justify-content:center!important;border:0!important;box-shadow:0 6px 18px rgba(29,95,214,.35)!important;}
 .st-key-new_chat button:hover{filter:brightness(1.08);}
-.side-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:#8E86C2;font-weight:600;margin:1.6rem 0 .4rem .4rem;}
-.side-empty{color:#8E86C2;font-size:.84rem;padding:.2rem .5rem;}
+.side-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:#9DB7E8;font-weight:600;margin:1.6rem 0 .4rem .4rem;}
+.side-empty{color:#9DB7E8;font-size:.84rem;padding:.2rem .5rem;}
 .side-foot{position:fixed;bottom:16px;left:22px;font-size:.78rem;}
-.side-foot a{color:#8E86C2;text-decoration:none;} .side-foot a:hover{color:#fff;}
+.side-foot a{color:#9DB7E8;text-decoration:none;} .side-foot a:hover{color:#fff;}
 
 /* ---------- chat input ---------- */
 [data-testid="stBottom"]>div,[data-testid="stBottomBlockContainer"]{background:linear-gradient(to top,#fff 65%,rgba(255,255,255,0));}
 [data-testid="stChatInput"],[data-testid="stChatInput"]>div{border:1px solid var(--line)!important;border-radius:20px!important;
-  background:#fff!important;box-shadow:0 8px 30px rgba(32,20,90,.10)!important;}
+  background:#fff!important;box-shadow:0 8px 30px rgba(10,42,107,.10)!important;}
 [data-testid="stChatInput"]:focus-within,[data-testid="stChatInput"]>div:focus-within{border-color:var(--accent)!important;
-  box-shadow:0 8px 32px rgba(106,65,224,.20)!important;}
+  box-shadow:0 8px 32px rgba(29,95,214,.20)!important;}
 [data-testid="stChatInput"] textarea{background:transparent!important;color:var(--ink);}
 [data-testid="stChatInputSubmitButton"]{background:linear-gradient(135deg,var(--accent),var(--accent2))!important;color:#fff!important;border-radius:12px;}
 .stProgress>div>div>div>div{background:linear-gradient(90deg,var(--accent),var(--accent2));}
 [data-testid="stTabs"] [aria-selected="true"]{color:var(--accent);}
-[data-baseweb="tab-highlight"]{background-color:var(--accent)!important;}
+[data-baseweb="tab-highlight"]{display:none!important;}
+[data-baseweb="tab-list"] button[aria-selected="true"]{border-bottom:2px solid var(--accent);}
 
 /* ---------- conversation ---------- */
 [data-testid="stChatMessage"]{background:transparent;padding:.7rem 0;gap:.9rem;}
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]){background:#fff;border:1px solid var(--line);
-  border-radius:16px;padding:.8rem 1.1rem;box-shadow:0 2px 8px rgba(32,20,90,.04);}
+  border-radius:16px;padding:.8rem 1.1rem;box-shadow:0 2px 8px rgba(10,42,107,.04);}
 [data-testid="stChatMessageAvatarUser"]{background:var(--deep2);color:#fff;}
 [data-testid="stChatMessageAvatarAssistant"]{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;}
 [data-testid="stExpander"]{border:1px solid var(--line);border-radius:12px;background:#fff;}
 [data-testid="stStatus"]{border:1px solid var(--line);border-radius:14px;background:#fff;}
 
 /* ---------- welcome ---------- */
-.hero{text-align:center;margin:7vh 0 1.6rem;}
+.hero{text-align:center;margin:13vh 0 1.4rem;}
 .pill{display:inline-block;font-size:.7rem;font-weight:600;letter-spacing:.12em;color:var(--accent);background:var(--accent-soft);
-  border:1px solid #DDD3FF;padding:.3rem .8rem;border-radius:999px;margin-bottom:1.1rem;}
+  border:1px solid #CFE0FF;padding:.3rem .8rem;border-radius:999px;margin-bottom:1.1rem;}
 .hero h1{font-size:2.5rem;font-weight:700;color:var(--deep)!important;margin:0;letter-spacing:-.8px;line-height:1.15;}
-.hero h1 span{-webkit-text-fill-color:transparent;background:linear-gradient(90deg,var(--accent),#A855F7);-webkit-background-clip:text;background-clip:text;color:transparent;}
+.hero h1 span{-webkit-text-fill-color:transparent;background:linear-gradient(90deg,var(--accent),#60A5FA);-webkit-background-clip:text;background-clip:text;color:transparent;}
 .hero p{color:var(--muted);margin:.9rem auto 0;font-size:1.02rem;max-width:560px;line-height:1.55;}
 .feats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:1.8rem 0 1.2rem;}
-.feat{background:#fff;border:1px solid var(--line);border-radius:16px;padding:1.1rem 1.15rem;box-shadow:0 4px 16px rgba(32,20,90,.05);}
+.feat{background:#fff;border:1px solid var(--line);border-radius:16px;padding:1.1rem 1.15rem;box-shadow:0 4px 16px rgba(10,42,107,.05);}
 .feat .ic{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;
   align-items:center;justify-content:center;margin-bottom:.8rem;}
 .feat .ic svg{width:20px;height:20px;stroke:#fff;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
@@ -1142,7 +1197,7 @@ header[data-testid="stHeader"]{background:transparent;}
 .feat span{color:var(--muted);font-size:.84rem;line-height:1.45;}
 .try{text-align:center;color:var(--muted);font-size:.8rem;margin:1.4rem 0 .5rem;}
 .main .stButton>button{border:1px solid var(--line);border-radius:12px;background:#fff;color:var(--ink);padding:.7rem 1rem;
-  font-weight:500;font-size:.85rem;box-shadow:0 1px 2px rgba(32,20,90,.04);}
+  font-weight:500;font-size:.85rem;box-shadow:0 1px 2px rgba(10,42,107,.04);}
 .main .stButton>button:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft);}
 
 /* ---------- KPI cards ---------- */
@@ -1154,19 +1209,19 @@ header[data-testid="stHeader"]{background:transparent;}
 .kpi.accent .v,.kpi.accent .l{color:#fff;}
 
 /* ---------- generated tables ---------- */
-.gt-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:#fff;box-shadow:0 4px 16px rgba(32,20,90,.05);}
+.gt-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:#fff;box-shadow:0 4px 16px rgba(10,42,107,.05);}
 table.gt{width:100%;border-collapse:collapse;font-size:.82rem;}
 table.gt th{background:var(--deep2);color:#fff;text-align:left;padding:.65rem .75rem;font-weight:600;white-space:nowrap;position:sticky;top:0;}
 table.gt td{padding:.6rem .75rem;border-top:1px solid var(--line);vertical-align:top;color:var(--ink);}
-table.gt tr:nth-child(even) td{background:#FBFAFF;}
+table.gt tr:nth-child(even) td{background:#F8FAFF;}
 table.gt tr:hover td{background:var(--accent-soft);}
 table.gt a{color:var(--accent);text-decoration:none;font-weight:500;}
 table.gt a:hover{text-decoration:underline;}
 .bd{display:inline-block;padding:.12rem .55rem;border-radius:999px;font-size:.72rem;font-weight:600;white-space:nowrap;}
 .bd-ok{background:#DCFCE7;color:#166534;} .bd-warn{background:#FEF3C7;color:#92400E;}
-.bd-bad{background:#FEE2E2;color:#991B1B;} .bd-na{background:#E8E6F4;color:#4B4872;}
-.bd-vh{background:var(--deep2);color:#fff;} .bd-h{background:#E4DBFF;color:#4C2BB8;}
-.bd-m{background:#E8E6F4;color:#3D3A63;} .bd-l{background:#F3F2FA;color:#6B6890;}
+.bd-bad{background:#FEE2E2;color:#991B1B;} .bd-na{background:#E6ECF7;color:#475569;}
+.bd-vh{background:var(--deep2);color:#fff;} .bd-h{background:#DBE7FF;color:#1E40AF;}
+.bd-m{background:#E6ECF7;color:#334155;} .bd-l{background:#F1F5FB;color:#5B6B8C;}
 .muted{color:var(--muted);} .dl-title{font-size:.8rem;color:var(--muted);margin:1rem 0 .3rem;}
 .stDownloadButton>button{color:var(--accent);border:1px solid var(--accent);border-radius:10px;font-weight:600;background:#fff;}
 .stDownloadButton>button:hover{background:var(--accent);color:#fff;border-color:var(--accent);}
@@ -1211,7 +1266,7 @@ def table_html(cols: list[str], rows: list[dict]) -> str:
 def kpi_html(people: list[dict], companies: dict, elapsed: float) -> str:
     n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
     items = [(len(people), "Contacts", True), (n_high, "High confidence", False),
-             (len(companies), "Companies", False), (f"{elapsed}s", "Research time", False)]
+             (len(companies), "Companies", False), ("Cached" if elapsed < 0.2 else f"{elapsed}s", "Research time", False)]
     return '<div class="kpis">' + "".join(
         f'<div class="kpi{" accent" if a else ""}"><div class="v">{v}</div><div class="l">{l}</div></div>'
         for v, l, a in items) + "</div>"
@@ -1227,9 +1282,11 @@ def detail_html(x: dict) -> str:
         roles = "; ".join(" · ".join(filter(None, (r["title"], r["company"], r["period"])))
                           for r in p["previous_roles"])
         parts.append(f"<p><b>Previous roles:</b> {esc(roles)}</p>")
-    if p.get("linkedin_url", "").startswith("http"):
-        parts.append(f'<p><b>LinkedIn:</b> <a href="{esc(p["linkedin_url"])}" target="_blank">'
-                     f'{esc(_domain_of(p["linkedin_url"]))} ↗</a></p>')
+    find = linkedin_search_url(p.get("full_name") or x["contact"]["name_guess"], p.get("current_company", ""))
+    li = p.get("linkedin_url", "")
+    parts.append("<p><b>LinkedIn:</b> " + (f'<a href="{esc(li)}" target="_blank">Open profile ↗</a> · ' if li else "")
+                 + f'<a href="{esc(find)}" target="_blank">Search on LinkedIn ↗</a> '
+                   '<span class="muted">(use this if a profile link shows an error)</span></p>')
     if p.get("sources"):
         links = " · ".join(f'<a href="{esc(u)}" target="_blank">{esc(_domain_of(u))}</a>' for u in p["sources"][:6])
         parts.append(f"<p><b>Sources:</b> {links}</p>")
@@ -1262,7 +1319,7 @@ def render_result(msg: dict, mid: str) -> None:
 
     files = msg.get("files") or {}
     st.markdown('<div class="dl-title">Download report</div>', unsafe_allow_html=True)
-    c1, c2, c3, _ = st.columns([1, 1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1.6])
     specs = [(c1, "pdf", "PDF", "contact_intelligence.pdf", "application/pdf"),
              (c2, "docx", "Word", "contact_intelligence.docx",
               "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
@@ -1275,6 +1332,9 @@ def render_result(msg: dict, mid: str) -> None:
                                    key=f"dl_{mid}_{key}", use_container_width=True)
             else:
                 st.caption(f"{label} unavailable")
+    with c4:
+        st.button("↻ Re-research (fresh data)", key=f"rr_{mid}", use_container_width=True,
+                  on_click=lambda m=mid: st.session_state.__setitem__("refresh", m))
 
 
 # ======================================================================================
@@ -1322,7 +1382,8 @@ def render_message(m: dict, mid: str) -> None:
             render_result(m, mid)
 
 
-def process(text: str, files: list, hint: str, include_sender: bool, force: bool) -> dict:
+def process(text: str, files: list, hint: str, include_sender: bool, force: bool,
+            preset: list[Contact] | None = None) -> dict:
     contacts: list[Contact] = []
     seen: set[str] = set()
 
@@ -1334,6 +1395,8 @@ def process(text: str, files: list, hint: str, include_sender: bool, force: bool
 
     with st.status("Reading your input…", expanded=True) as status:
         try:
+            if preset:
+                add(preset)
             if text.strip():
                 add(smart_parse(text, S, hint, include_sender))
             for f in files:
@@ -1383,6 +1446,10 @@ FOLLOWUP_SYSTEM = (
     "results) and the FRESH WEB EVIDENCE. Never invent facts, titles, employers or URLs; if something is not "
     "supported by the evidence, say it was not found. Cite sources as markdown links [site](url). "
     "Be concise and well structured: short paragraphs or bullet points, bold key facts. "
+    "Only cite URLs that appear in CONTEXT or FRESH WEB EVIDENCE; never create or guess a URL, and never say a page "
+    "shows something unless the evidence snippet does. If the user reports a broken link, explain that search-index "
+    "links can be outdated or private, quote what the evidence snippet says, and suggest searching the name and company "
+    "on LinkedIn. Treat LinkedIn as the primary source for a person\'s CURRENT title. "
     "When asked for more details about a person, cover: current role, company, location, career history, "
     "expertise/skills, public activity, and a confidence note. Reply in the user's language."
 )
@@ -1422,7 +1489,8 @@ def build_followup_messages(question: str, history: list[dict], s: Settings) -> 
     target = _find_target(question, people)
     if target:
         who = f'{target["name"]} {target.get("current_company") or ""}'.strip()
-        queries = [(f'"{target["name"]}" {target.get("current_company") or ""}', None),
+        queries = [(f'"{target["name"]}" {target.get("current_company") or ""}', ("linkedin.com",)),
+                   (f'"{target["name"]}" {target.get("current_company") or ""}', None),
                    (f"{who} experience career background", None),
                    (f'"{target["name"]}" {target.get("current_company") or ""}', tuple(PEOPLE_SITES))]
     else:
@@ -1445,6 +1513,29 @@ def stream_chat(messages: list[dict], s: Settings) -> Iterator[str]:
     for chunk in client.chat.completions.create(model=s.deployment, messages=messages, stream=True):
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
+
+
+PLACEHOLDER = "Paste contacts or a screenshot, or ask a follow-up question…"
+
+
+def read_input(key: str) -> tuple[bool, str, list]:
+    """Chat box. Inside a column (new chat) it renders inline/centred; at top level it pins to the bottom."""
+    fallback: list = []
+    try:
+        val = st.chat_input(PLACEHOLDER, accept_file="multiple",
+                            file_type=["png", "jpg", "jpeg", "webp"], key=key)
+    except TypeError:  # Streamlit < 1.43
+        with st.sidebar:
+            fallback = st.file_uploader("Screenshots", type=["png", "jpg", "jpeg", "webp"],
+                                        accept_multiple_files=True, key=f"up_{key}") or []
+        val = st.chat_input(PLACEHOLDER, key=key)
+    text, files = "", list(fallback)
+    if isinstance(val, str):
+        text = val
+    elif val:
+        text = getattr(val, "text", "") or ""
+        files = list(getattr(val, "files", None) or [])
+    return bool(val), text, files
 
 
 def main() -> None:
@@ -1478,46 +1569,50 @@ def main() -> None:
     chat = ss.chats[ss.current]
     msgs = chat["messages"]
 
-    # ---------------- Conversation ----------------
-    if not msgs:
+    # ---------------- Conversation / input ----------------
+    if not msgs:  # new chat: ChatGPT-style centred prompt box
         st.markdown(
             '<div class="hero"><div class="pill">CONTACT INTELLIGENCE</div>'
             '<h1>Know exactly who you are <span>talking to</span></h1>'
             '<p>Paste an email thread or contact list, or drop a screenshot. Get verified roles, '
-            'companies and a report you can share.</p></div>'
-            '<div class="feats">'
-            '<div class="feat">' + ICON_DOC + '<b>Paste anything</b><span>Email headers, or a list of Name &lt;email&gt; contacts.</span></div>'
-            '<div class="feat">' + ICON_IMG + '<b>Drop a screenshot</b><span>Invites, signatures and business cards. Ctrl+V works.</span></div>'
-            '<div class="feat">' + ICON_DL + '<b>Export in one click</b><span>Download results as PDF, Word or Excel.</span></div>'
-            '</div><div class="try">Or try a sample</div>', unsafe_allow_html=True)
+            'companies and a report you can share.</p></div>', unsafe_allow_html=True)
+        _, mid_col, _ = st.columns([1, 6, 1])
+        with mid_col:
+            got, text, files = read_input("chat_in_center")
+        st.markdown('<div class="try">Or try a sample</div>', unsafe_allow_html=True)
         _, c1, c2, _ = st.columns([1, 2, 2, 1])
         for col, s_ in zip((c1, c2), SUGGESTIONS):
             with col:
                 st.button(", ".join(EMAIL_RE.findall(s_))[:34] + "…", key=f"sug_{hash(s_)}",
                           use_container_width=True, on_click=_set_pending, args=(s_,))
-    for i, m in enumerate(msgs):
-        render_message(m, f"{ss.current}_{i}")
+        st.markdown(
+            '<div class="feats">'
+            '<div class="feat">' + ICON_DOC + '<b>Paste anything</b><span>Email headers, or a list of Name &lt;email&gt; contacts.</span></div>'
+            '<div class="feat">' + ICON_IMG + '<b>Drop a screenshot</b><span>Invites, signatures and business cards. Ctrl+V works.</span></div>'
+            '<div class="feat">' + ICON_DL + '<b>Export in one click</b><span>Download results as PDF, Word or Excel.</span></div>'
+            '</div>', unsafe_allow_html=True)
+    else:
+        for i, m in enumerate(msgs):
+            render_message(m, f"{ss.current}_{i}")
 
-    # ---------------- Input ----------------
-    fallback_files: list = []
-    try:
-        val = st.chat_input("Paste contacts or a screenshot, or ask a follow-up question…",
-                            accept_file="multiple", file_type=["png", "jpg", "jpeg", "webp"])
-    except TypeError:  # Streamlit < 1.43
-        with st.sidebar:
-            fallback_files = st.file_uploader("Screenshots", type=["png", "jpg", "jpeg", "webp"],
-                                              accept_multiple_files=True) or []
-        val = st.chat_input("Paste contacts or ask a follow-up…")
+        if ss.get("refresh"):  # "Re-research" button on a result
+            idx = int(str(ss.refresh).rsplit("_", 1)[1])
+            ss.refresh = None
+            if S.ready and 0 <= idx < len(msgs) and msgs[idx].get("result"):
+                cts = [Contact(email=x["contact"]["email"], display_name=x["contact"]["display_name"],
+                               local=x["contact"]["email"].split("@")[0], domain=x["contact"]["domain"],
+                               name_guess=x["contact"]["name_guess"]) for x in msgs[idx]["result"]["people"]]
+                msgs.append({"role": "user", "text": "↻ Re-research with fresh data", "images": []})
+                render_message(msgs[-1], "tmp")
+                with st.chat_message("assistant", avatar=":material/hub:"):
+                    reply = process("", [], "", False, True, preset=cts)
+                msgs.append(reply)
+                st.rerun()
+        got, text, files = read_input("chat_in_bottom")
 
-    text, files = "", list(fallback_files)
-    if isinstance(val, str):
-        text = val
-    elif val:
-        text = getattr(val, "text", "") or ""
-        files = list(getattr(val, "files", None) or [])
     if ss.pending:
         text, ss.pending = ss.pending, None
-    if not (text.strip() or (files and val)):
+    if not (text.strip() or files):
         return
     if not S.ready:
         st.error("Configure API keys in .env first.")
@@ -1548,6 +1643,7 @@ def main() -> None:
             reply = {"role": "assistant", "text": answer}
     msgs.append(reply)
     st.rerun()
+
 
 if __name__ == "__main__":
     main()
