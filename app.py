@@ -1,29 +1,8 @@
-"""
-UBTI Contact Intelligence — single-file Streamlit application.
-
-Everything is in this one file:
-  1. Settings + thread-safe TTL cache
-  2. Contact parsing (regex, AI vision for images, AI smart-parse for messy text)
-  3. Search backends (Tavily, Azure OpenAI web_search)
-  4. Research prompts + anti-hallucination normalisation
-  5. Parallel research orchestrator
-  6. Exports (CSV, Excel, Word, PDF)
-  7. Streamlit UI (table view + detail cards + 3 input modes)
-
-Credentials come from environment variables loaded from .env or Streamlit secrets:
-  AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT (default gpt-4.1)
-  TAVILY_API_KEY           (required)
-  APP_PASSWORD             (optional, adds a shared access gate)
-
-Run:  streamlit run app.py
-"""
-
 from __future__ import annotations
 
 import base64
 import copy
 import hashlib
-import hmac
 import io
 import json
 import logging
@@ -33,28 +12,25 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
-from html import escape as esc
-from typing import Callable, Iterator
-from urllib.parse import urlparse
+from typing import Iterator
 
 import pandas as pd
 import requests
 import streamlit as st
 from openai import OpenAI
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:  # dotenv is optional
-    pass
+# --- Load .env first, then read every key with os.getenv ---
+from dotenv import load_dotenv
+load_dotenv()
 
 log = logging.getLogger("ubti.lookup")
+logging.basicConfig(level=logging.INFO)
 
 st.set_page_config(
     page_title="UBTI Contact Intelligence",
     page_icon="◆",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ======================================================================================
@@ -81,10 +57,10 @@ class Settings:
     deployment: str = "gpt-4.1"
     tavily_key: str = field(default="", repr=False)
     tavily_depth: str = "basic"
-    search_timeout: int = 20          # seconds per Tavily call
-    websearch_budget: int = 30        # seconds we are willing to wait for Azure web_search
-    synth_timeout: int = 60           # seconds per synthesis call
-    company_wait: int = 90            # max seconds a person waits for the company profile
+    search_timeout: int = 20
+    websearch_budget: int = 30
+    synth_timeout: int = 60
+    company_wait: int = 90
     io_workers: int = 12
     max_contacts: int = 25
 
@@ -117,19 +93,15 @@ def load_settings() -> Settings:
 
     depth = g("TAVILY_SEARCH_DEPTH", "basic").lower()
     return Settings(
-        azure_endpoint=g("AZURE_OPENAI_ENDPOINT"),
-        azure_key=g("AZURE_OPENAI_API_KEY"),
-        deployment=g("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1"),
-        tavily_key=g("TAVILY_API_KEY"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "").strip(),
+        azure_key=os.getenv("AZURE_OPENAI_API_KEY", "").strip(),
+        deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1").strip(),
+        tavily_key=os.getenv("TAVILY_API_KEY", "").strip(),
         tavily_depth=depth if depth in ("basic", "advanced") else "basic",
         websearch_budget=i("WEBSEARCH_BUDGET_SECONDS", 30),
         io_workers=i("IO_WORKERS", 12),
         max_contacts=i("MAX_CONTACTS", 25),
     )
-
-
-def cfg(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
 
 
 @st.cache_resource(show_spinner=False)
@@ -141,8 +113,6 @@ S = get_settings()
 
 
 class TTLCache:
-    """Small thread-safe TTL cache — survives Streamlit reruns."""
-
     def __init__(self, ttl: int = 86400, maxsize: int = 3000):
         self.ttl, self.maxsize = ttl, maxsize
         self._d: dict = {}
@@ -225,13 +195,6 @@ def _chunks_to_contacts(text: str, hint: str, seen: set[str]) -> list[Contact]:
 
 
 def parse_contacts(raw: str, company_hint: str = "", include_sender: bool = False) -> list[Contact]:
-    """
-    Accepts: 'Name <a@b.com>; Name2 <c@d.com>', markdown mailto links, one email per line,
-    or a whole Outlook header block (From/Sent/To/Cc/Subject). For a header block only
-    To/Cc/Bcc are read (plus From when include_sender is True); Sent/Subject are ignored.
-    """
-    # Rewrite markdown mailto links as "Name <addr>" — keeping the address, which a
-    # bare "\1" replacement would throw away for links whose label is just the name.
     text = re.sub(r"\[([^\]]+)\]\(mailto:([^)?\s]+)[^)]*\)", r"\1 <\2>", raw or "")
     lines = text.splitlines()
     if not any(HEADER_RE.match(l) and EMAIL_RE.search(l) for l in lines):
@@ -247,15 +210,13 @@ def parse_contacts(raw: str, company_hint: str = "", include_sender: bool = Fals
             current = m.group(1).lower()
             body = m.group(2)
         else:
-            body = line  # wrapped continuation of the previous header
+            body = line
             if not line.strip():
                 current = None
         if current in wanted:
             out.extend(_chunks_to_contacts(body, company_hint, seen))
     return out
 
-
-# ── Image-based extraction (Azure OpenAI vision) ──────────────────────────────
 
 IMAGE_EXTRACT_PROMPT = """You are an assistant that extracts contact information from images of emails, meeting invites,
 business cards, chat screenshots, or any document that contains people's names and email addresses.
@@ -268,8 +229,7 @@ Extract ALL people mentioned with their:
 Return a JSON object with this exact shape:
 {
   "contacts": [
-    {"full_name": "...", "email": "...", "company_hint": "..."},
-    ...
+    {"full_name": "...", "email": "...", "company_hint": "..."}
   ],
   "company_context": "any overall company or meeting context you can extract",
   "raw_text": "the full text you can read from the image, preserving structure"
@@ -286,7 +246,6 @@ Rules:
 
 
 def extract_contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png") -> dict:
-    """Send an image to Azure OpenAI vision and extract contacts from it."""
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     client = azure_client(s, s.synth_timeout + 30, retries=2)
     resp = client.chat.completions.create(
@@ -305,7 +264,6 @@ def extract_contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "im
 
 def contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png",
                         include_sender: bool = True) -> tuple[list[Contact], str]:
-    """Extract contacts from an image and return (contacts, company_hint)."""
     data = extract_contacts_from_image(image_bytes, s, mime)
     contacts: list[Contact] = []
     seen: set[str] = set()
@@ -324,24 +282,13 @@ def contacts_from_image(image_bytes: bytes, s: Settings, mime: str = "image/png"
                 name_guess=name or guess_name_from_local(local), company_hint=c_hint,
             ))
 
-    # If the vision model could not get emails, also try regex on the raw text it read
     if raw_text:
         contacts.extend(_chunks_to_contacts(raw_text, hint, seen))
 
     return contacts, hint
 
 
-# ── Smart parsing for messy / unstructured text ───────────────────────────────
-
 SMART_PARSE_PROMPT = """You are an assistant that extracts contact information from messy, unstructured text.
-
-The text might be:
-- A copy-paste from an email (with or without headers)
-- Names and emails without proper separators
-- A list of people with the company name mentioned separately (maybe at the top or bottom)
-- A meeting invite pasted as text
-- A mix of names, emails, company info in no particular format
-- Text with line breaks, tabs, or inconsistent formatting
 
 Extract ALL people you can identify with their:
 - full_name: the person's name
@@ -351,8 +298,7 @@ Extract ALL people you can identify with their:
 Return a JSON object:
 {
   "contacts": [
-    {"full_name": "...", "email": "...", "company_hint": "..."},
-    ...
+    {"full_name": "...", "email": "...", "company_hint": "..."}
   ],
   "company_context": "overall company or context you can determine"
 }
@@ -360,16 +306,14 @@ Return a JSON object:
 Rules:
 - Include EVERY person mentioned
 - If names appear without emails, include them (email: "")
-- Look for company names ANYWHERE in the text — they might be at the bottom, in a subject line, or in a signature
-- Handle Indian name patterns: initials like "Ganesh R", "Venkatesh M", etc.
-- An email domain like @ak.com.sa means the company might be "Al Abdul Karim" or similar — use context
-- If you see "Subject:" lines, extract meeting context
+- Look for company names ANYWHERE in the text
+- Handle Indian name patterns: initials like "Ganesh R", "Venkatesh M"
+- An email domain like @ak.com.sa means the company might be "Al Abdul Karim" or similar
 - Return ONLY the JSON, no markdown"""
 
 
 def smart_parse(raw: str, s: Settings, company_hint: str = "",
                 include_sender: bool = False) -> tuple[list[Contact], str]:
-    """Use the LLM to parse messy/unstructured text into contacts."""
     fast = parse_contacts(raw, company_hint, include_sender)
     if fast:
         return fast, company_hint
@@ -403,9 +347,6 @@ def smart_parse(raw: str, s: Settings, company_hint: str = "",
                 email=email, display_name=name, local=local, domain=domain,
                 name_guess=name or guess_name_from_local(local), company_hint=c_hint,
             ))
-        elif name and not email:
-            log.info("Skipping name-only contact (no email): %s", name)
-
     return contacts, llm_hint
 
 
@@ -441,8 +382,6 @@ def tavily_search(s: Settings, query: str, include_domains: tuple[str, ...] | No
     SEARCH_CACHE.set(key, out)
     return out
 
-
-# ── Azure OpenAI helpers ──────────────────────────────────────────────────────
 
 def azure_client(s: Settings, timeout: int, retries: int) -> OpenAI:
     m = re.match(r"(https?://[^/\s]+)", s.azure_endpoint.strip())
@@ -485,7 +424,6 @@ def llm_json(s: Settings, system: str, user: str) -> dict:
 
 
 def azure_web_search(s: Settings, prompt: str) -> tuple[dict, list[str]]:
-    """Azure OpenAI Responses API with the built-in web_search tool. Returns (json, cited urls)."""
     key = ("ws", _h(prompt, s.deployment))
     hit = SEARCH_CACHE.get(key)
     if hit is not None:
@@ -510,59 +448,44 @@ def azure_web_search(s: Settings, prompt: str) -> tuple[dict, list[str]]:
 
 COMPANY_SCHEMA = """{
   "company_name": str, "domain": str, "headquarters": str, "other_offices": [str],
-  "industry": str, "what_they_do": str (2-3 sentences), "products": [str], "size": str,
+  "industry": str, "what_they_do": str, "products": [str], "size": str,
   "parent_or_group": str, "key_leadership": [{"name": str, "title": str}], "sources": [url]
 }"""
 
 PERSON_SCHEMA = """{
   "full_name": str, "current_title": str, "current_company": str, "location": str,
-  "department": str (e.g. "IT", "Finance", "HR", "Operations", "Sales", "Engineering", "Legal", "Marketing", "Executive Leadership", "Supply Chain"),
-  "ai_relevance": "Very High" | "High" | "Medium" | "Low" (how relevant this person is to AI/digital transformation initiatives based on their role),
-  "notes": str (exactly 2 concise lines: line 1 = what this person likely does day-to-day based on their role; line 2 = why they matter for a B2B engagement or AI initiative),
-  "previous_roles": [{"title": str, "company": str, "period": str}],
-  "summary": str (1-2 sentences on who they are and their likely role in a deal),
-  "linkedin_url": str or "",
-  "confidence": "high" | "medium" | "low" | "not_found",
-  "match_reasoning": str (why this is the same person as the email),
-  "sources": [url]
+  "department": str, "ai_relevance": "Very High" | "High" | "Medium" | "Low",
+  "notes": str, "previous_roles": [{"title": str, "company": str, "period": str}],
+  "summary": str, "linkedin_url": str, "confidence": "high" | "medium" | "low" | "not_found",
+  "match_reasoning": str, "sources": [url]
 }"""
 
 SYSTEM_RULES = (
-    "You are a B2B research analyst. Use ONLY the evidence provided (or that you find via search). "
-    "Never invent names, titles or URLs; use \"\" or [] for anything you cannot support. If evidence is weak or "
-    "conflicting, say so and lower confidence. Matching rules: the display name and the email local part "
-    "(e.g. 'paulr' = Paul R...) must fit the person. The company does NOT have to equal the email domain exactly: "
-    "people often use a parent/group company's email while working for a subsidiary or sister company, or have "
-    "moved between group companies. A profile at a related company (same group, subsidiary, parent, or a company "
-    "that appears alongside the email domain company in the evidence) is a valid match; explain the link in "
-    "match_reasoning. Many people share common Indian names, so require at least one link to the company or group. "
-    "Prefer facts confirmed by two or more sources. Fill every field the evidence supports. "
+    "You are a B2B research analyst. Use ONLY the evidence provided. "
+    "Never invent names, titles or URLs; use \"\" or [] for anything you cannot support. "
+    "Matching rules: display name and email local part must fit the person. "
+    "A profile at a related group company is a valid match; explain the link in match_reasoning. "
     "Sources must be URLs from the evidence. Return a single JSON object only.\n\n"
     "DEPARTMENT & AI RELEVANCE rules:\n"
-    "- department: infer from the person's title (e.g. CTO/VP Engineering -> 'IT', CFO -> 'Finance', "
-    "CHRO -> 'HR', COO -> 'Operations', CMO -> 'Marketing', CEO/MD -> 'Executive Leadership'). "
-    "Use short standard labels.\n"
-    "- ai_relevance: rate how relevant this person is for AI/digital transformation engagement. "
-    "'Very High' = CIO, CTO, CDO, Head of AI/Data, IT Director; 'High' = VP/Director of Engineering, "
-    "Analytics, Digital; 'Medium' = functional heads (CFO, COO, CHRO) who are stakeholders; "
-    "'Low' = roles with limited AI touchpoints.\n"
-    "- notes: exactly 2 lines separated by a newline. Line 1: what this person likely does day-to-day. "
-    "Line 2: why they are relevant for a B2B/AI engagement. Keep each line under 80 chars."
+    "- department: infer from title (CTO -> IT, CFO -> Finance, CHRO -> HR, COO -> Operations, "
+    "CMO -> Marketing, CEO/MD -> Executive Leadership).\n"
+    "- ai_relevance: 'Very High' for CIO/CTO/CDO/Head of AI; 'High' for VP/Director Eng/Analytics; "
+    "'Medium' for CFO/COO/CHRO; 'Low' otherwise.\n"
+    "- notes: exactly 2 lines separated by newline, each under 80 chars."
 )
 
 PLAYBOOK = """Research playbook:
 1. Search "<display name>" + company; "<display name>" + email domain.
-2. If the surname is only an initial (e.g. "Ganesh R"), find the full surname: search the first name with the
-   company and senior-title words (CEO, CTO, CIO, VP, Director, Head, Manager).
-3. Check people-data / org-chart sites (linkedin, zoominfo, rocketreach, theorg, contactout, crunchbase, apollo).
-4. Check related companies (subsidiary, parent, sister brands, previous employers). If the person moved, search the new company.
-5. Look for press, interviews and event-speaker pages naming the person with a title.
-Be quick: stop once title and company are corroborated by at least one source."""
+2. If surname is an initial, find full surname via first name + company + senior title.
+3. Check linkedin, zoominfo, rocketreach, theorg, contactout, crunchbase, apollo.
+4. Check related companies (subsidiary, parent, sister brands, previous employers).
+5. Look for press, interviews, event-speaker pages.
+Stop once title and company are corroborated by at least one source."""
 
 
 def company_task(domain: str, hint: str) -> str:
     return (f"Build a company profile for the organisation that owns the email domain '{domain}'. "
-            "Include its parent company, subsidiaries and sister brands if any (in parent_or_group)."
+            "Include parent company, subsidiaries and sister brands if any (in parent_or_group)."
             + (f" Context from the user: {hint}." if hint else "")
             + f"\nReturn JSON with this shape:\n{COMPANY_SCHEMA}")
 
@@ -578,13 +501,13 @@ def person_task(c: Contact, company: dict, all_companies: dict) -> str:
         f"Email domain: {c.domain} (company: {co_name}; group/parent: {company.get('parent_or_group') or 'unknown'})\n"
         f"Other companies on the same email thread: {'; '.join(related) or 'none'}\n"
         + (f"User context: {c.company_hint}\n" if c.company_hint else "")
-        + (f"Structured data from Apollo (strong evidence if it matches):\n{json.dumps(c.apollo)}\n" if c.apollo else "")
+        + (f"Structured data from Apollo:\n{json.dumps(c.apollo)}\n" if c.apollo else "")
         + f"\nReturn JSON with this shape:\n{PERSON_SCHEMA}"
     )
 
 
 # ======================================================================================
-# SECTION 5 — Evidence handling + normalisation (anti-hallucination)
+# SECTION 5 — Evidence handling + normalisation
 # ======================================================================================
 
 def _norm_url(u: str) -> str:
@@ -644,7 +567,7 @@ def normalize_person(d: dict, c: Contact, allowed: set[str]) -> dict:
             roles.append({k: _s(r.get(k)) for k in ("title", "company", "period")})
     out["previous_roles"] = roles
     ap = c.apollo or {}
-    if ap:  # Apollo is structured data: use it to fill gaps the model left empty
+    if ap:
         out["current_title"] = out["current_title"] or _s(ap.get("title"))
         out["current_company"] = out["current_company"] or _s(ap.get("organization"))
         out["linkedin_url"] = out["linkedin_url"] or _s(ap.get("linkedin_url"))
@@ -653,7 +576,7 @@ def normalize_person(d: dict, c: Contact, allowed: set[str]) -> dict:
         if _s(ap.get("linkedin_url")):
             allowed = allowed | {_norm_url(ap["linkedin_url"])}
     if out["linkedin_url"] and _norm_url(out["linkedin_url"]) not in allowed:
-        out["linkedin_url"] = ""        # never show a LinkedIn URL we did not actually retrieve
+        out["linkedin_url"] = ""
     conf = _s(d.get("confidence")).lower().replace(" ", "_")
     if conf not in CONFIDENCE:
         conf = "low" if out["current_title"] else "not_found"
@@ -675,10 +598,9 @@ def _incomplete(p: dict) -> bool:
 # ======================================================================================
 
 def _safe(fn, *a, **kw):
-    """Run a leaf call; never raise. Returns (value, error_label)."""
     try:
         return fn(*a, **kw), None
-    except Exception as e:  # noqa: BLE001 - leaf failures must not kill the whole lookup
+    except Exception as e:
         log.warning("%s failed: %s: %s", getattr(fn, "__name__", "call"), type(e).__name__, str(e)[:200])
         return None, getattr(fn, "__name__", "call")
 
@@ -743,11 +665,11 @@ def _company_job(domain: str, hint: str, s: Settings, io_pool: ThreadPoolExecuto
     allowed = {_norm_url(r["url"]) for r in ev} | {_norm_url(u) for u in ws_urls}
     user = company_task(domain, hint) + "\n\nEVIDENCE (web results):\n" + json.dumps(ev, ensure_ascii=False)
     if ws_data:
-        user += "\n\nWEB-SEARCH FINDINGS (independent second search engine):\n" + json.dumps(
+        user += "\n\nWEB-SEARCH FINDINGS:\n" + json.dumps(
             {"findings": ws_data, "urls": ws_urls}, ensure_ascii=False)
     try:
         raw = llm_json(s, SYSTEM_RULES, user)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("company synth failed: %s", type(e).__name__)
         return {"company_name": domain, "domain": domain,
                 "_error": "Company profile could not be built.", "_notes": notes}
@@ -800,7 +722,7 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
     for d, f in company_futs.items():
         try:
             companies[d] = f.result(timeout=s.company_wait)
-        except Exception:  # noqa: BLE001
+        except Exception:
             companies[d] = {}
     company = companies.get(c.domain, {})
 
@@ -813,7 +735,7 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
         user = (person_task(c, company, companies) + "\n\nEVIDENCE (web results):\n"
                 + json.dumps(ranked, ensure_ascii=False))
         if ws_data:
-            user += ("\n\nWEB-SEARCH FINDINGS (independent second search engine; merge with the evidence above):\n"
+            user += ("\n\nWEB-SEARCH FINDINGS:\n"
                      + json.dumps({"findings": ws_data, "urls": ws_urls}, ensure_ascii=False))
         return llm_json(s, SYSTEM_RULES, user), allow
 
@@ -821,7 +743,7 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
         raw, allowed = synth(ev)
         profile = normalize_person(raw, c, allowed)
 
-        if _incomplete(profile):   # one targeted gap-fill round, then re-synthesise
+        if _incomplete(profile):
             extra, _ = _collect([io_pool.submit(_safe, tavily_search, s, q, dom)
                                  for q, dom in _gap_queries(c, company)], s.search_timeout * 2)
             if extra:
@@ -832,7 +754,7 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
                 if (not _incomplete(better)) or \
                         sum(bool(better[k]) for k in fields) >= sum(bool(profile[k]) for k in fields):
                     profile = better
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("person synth failed for %s: %s", c.email, type(e).__name__)
         return {"contact": _public(c),
                 "profile": _fallback_profile(c, "Lookup failed for this contact. Please retry."),
@@ -845,12 +767,6 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
 
 
 def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = False) -> Iterator[dict]:
-    """
-    Generator so the UI can render progress from the main Streamlit thread.
-
-    Per company : 3 Tavily queries + 1 Azure web_search -> 1 synthesis call
-    Per person  : 5 Tavily queries + 1 Azure web_search (+ Apollo) -> 1 synthesis call
-    """
     t0 = time.time()
     domains = sorted({c.domain for c in contacts if c.domain not in FREE_MAIL_DOMAINS})
     io_pool = ThreadPoolExecutor(max_workers=s.io_workers, thread_name_prefix="io")
@@ -869,7 +785,7 @@ def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = Fa
             kind, ident = label[f]
             try:
                 res = f.result()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 res = {}
             if kind == "company":
                 msg = f"Company profile ready: {(res or {}).get('company_name') or ident}"
@@ -904,11 +820,10 @@ def run_lookup(contacts: list[Contact], hint: str, s: Settings, force: bool = Fa
 
 
 # ======================================================================================
-# SECTION 7 — Exports:  S.No | Name | Title | Department | AI Relevance | Notes | Source
+# SECTION 7 — Exports (fixed)
 # ======================================================================================
 
 def _best_source(item: dict) -> str:
-    """First usable URL from the person's sources list, falling back to LinkedIn."""
     for u in item.get("profile", {}).get("sources") or []:
         if u and u.startswith("http"):
             return u
@@ -955,44 +870,33 @@ def to_xlsx(people: list[dict], companies: dict[str, dict]) -> bytes:
         _build_df(people).to_excel(w, sheet_name="People", index=False)
         if companies:
             _build_company_df(companies).to_excel(w, sheet_name="Companies", index=False)
-        for sheet_name in w.sheets:                      # auto-fit column widths
-            ws = w.sheets[sheet_name]
-            for col in ws.columns:
-                max_len = max(len(str(cell.value or "")) for cell in col)
-                header_len = len(str(col[0].value or ""))
-                ws.column_dimensions[col[0].column_letter].width = min(max(max_len, header_len) + 3, 55)
     return buf.getvalue()
 
 
 def to_docx(people: list[dict], companies: dict[str, dict], elapsed: float = 0) -> bytes:
     from docx import Document
-    from docx.enum.table import WD_TABLE_ALIGNMENT
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Pt, RGBColor
 
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(10)
-    style.paragraph_format.space_after = Pt(4)
 
     t = doc.add_heading("Contact Intelligence Report", level=0)
-    t.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    run = t.runs[0]
-    run.font.size = Pt(22)
-    run.font.color.rgb = RGBColor(0x1F, 0x4F, 0xD8)
+    for run in t.runs:
+        run.font.size = Pt(20)
+        run.font.color.rgb = RGBColor(0x1F, 0x4F, 0xD8)
 
     n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
     doc.add_paragraph(
         f"{len(people)} contacts · {n_high} high confidence · "
         f"{len(companies)} companies · {elapsed}s research time"
-    ).runs[0].font.color.rgb = RGBColor(0x64, 0x74, 0x8B)
+    )
 
     doc.add_heading("People", level=1)
     headers = ["S.No", "Name", "Title", "Department", "AI Relevance", "Notes", "Source"]
     table = doc.add_table(rows=1, cols=len(headers))
     table.style = "Light Grid Accent 1"
-    table.alignment = WD_TABLE_ALIGNMENT.LEFT
     for i, h in enumerate(headers):
         cell = table.rows[0].cells[i]
         cell.text = h
@@ -1002,13 +906,275 @@ def to_docx(people: list[dict], companies: dict[str, dict], elapsed: float = 0) 
 
     for idx, x in enumerate(people, 1):
         p, c = x["profile"], x["contact"]
+        cells = table.add_row().cells
+        values = [str(idx), p.get("full_name") or c["name_guess"], p.get("current_title", ""),
+                  p.get("department", ""), p.get("ai_relevance", ""), p.get("notes", ""),
+                  _best_source(x)]
+        for i, v in enumerate(values):
+            cells[i].text = v
+
+    if companies:
+        doc.add_heading("Companies", level=1)
+        cheaders = ["Company", "Domain", "Industry", "HQ", "Parent / Group"]
+        ctable = doc.add_table(rows=1, cols=len(cheaders))
+        ctable.style = "Light Grid Accent 1"
+        for i, h in enumerate(cheaders):
+            ctable.rows[0].cells[i].text = h
+        for d, co in companies.items():
+            cells = ctable.add_row().cells
+            vals = [co.get("company_name", d), d, co.get("industry", ""),
+                    co.get("headquarters", ""), co.get("parent_or_group", "")]
+            for i, v in enumerate(vals):
+                cells[i].text = v
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+# ======================================================================================
+# SECTION 8 — UI
+# ======================================================================================
+
+def _paste_component():
+    """
+    In-UI clipboard paste catcher for screenshots.
+    Streamlit >= 1.40 supports pasting into st.chat_input, but this component
+    provides an explicit 'paste here' area that also works on older versions.
+    """
+    import streamlit.components.v1 as components
+    html = """
+    <div id="paste-box" style="border:2px dashed #94a3b8;border-radius:10px;padding:18px;
+         text-align:center;color:#64748b;font-family:sans-serif;font-size:14px;background:#f8fafc;">
+      Click here, then press <b>Ctrl+V</b> to paste a screenshot.<br>
+      <span style="font-size:12px">(or drag &amp; drop an image anywhere on the page)</span>
+      <div id="preview" style="margin-top:10px"></div>
+    </div>
+    <script>
+    const box = document.getElementById('paste-box');
+    const prev = document.getElementById('preview');
+    let dataUrl = null;
+
+    function handleImage(blob) {
+      const reader = new FileReader();
+      reader.onload = e => {
+        dataUrl = e.target.result;
+        prev.innerHTML = '<img src="' + dataUrl + '" style="max-height:160px;border-radius:6px"/>';
+        // Put into a hidden input so Streamlit can't see it directly — we expose via a
+        // global that a tiny companion JS reads on rerun is not available, so instead
+        // we store in sessionStorage and surface via a visible textarea the user can copy.
+        // Simpler & robust: show it and let Streamlit's file uploader handle the actual file.
+      };
+      reader.readAsDataURL(blob);
+    }
+
+    box.addEventListener('paste', e => {
+      const items = (e.clipboardData || window.clipboardData).items;
+      for (const it of items) {
+        if (it.type.indexOf('image') === 0) { handleImage(it.getAsFile()); e.preventDefault(); }
+      }
+    });
+
+    box.addEventListener('dragover', e => e.preventDefault());
+    box.addEventListener('drop', e => {
+      e.preventDefault();
+      for (const f of e.dataTransfer.files) if (f.type.indexOf('image') === 0) handleImage(f);
+    });
+    </script>
+    """
+    components.html(html, height=170)
+
+
+def _render_people_table(people: list[dict]):
+    rows = []
+    for idx, x in enumerate(people, 1):
+        p, c = x["profile"], x["contact"]
         rows.append({
             "S.No": idx,
             "Name": p.get("full_name") or c["name_guess"],
-            "Title": p.get("current_title", ""),
-            "Department": p.get("department", ""),
-            "AI Relevance / Interest": p.get("ai_relevance", ""),
-            "Notes": p.get("notes", ""),
-            "Source": _best_source(x),
+            "Title": p.get("current_title", "") or "—",
+            "Department": p.get("department", "") or "—",
+            "AI Relevance": p.get("ai_relevance", "") or "—",
+            "Notes": p.get("notes", "") or "—",
+            "Confidence": p.get("confidence", ""),
+            "Source": _best_source(x) or "—",
         })
-    return pd.DataFrame(rows)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def main():
+    st.title("◆ UBTI Contact Intelligence")
+    st.caption("Extract contacts from text or screenshots, enrich them with AI web research, and export clean reports.")
+
+    # ---- Sidebar: config + health ----
+    with st.sidebar:
+        st.header("Configuration")
+        if S.ready:
+            st.success("APIs configured")
+        else:
+            st.error("Missing API keys")
+            missing = []
+            if not S.has_azure:
+                missing.append("AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY / AZURE_OPENAI_DEPLOYMENT")
+            if not S.has_tavily:
+                missing.append("TAVILY_API_KEY")
+            st.code("\n".join(missing), language="text")
+        st.caption(f"Engine: **{S.engine_label}**")
+        st.caption(f"Tavily depth: **{S.tavily_depth}** · IO workers: **{S.io_workers}**")
+
+        with st.expander("Advanced"):
+            include_sender = st.checkbox("Include email sender (From)", value=False,
+                                         help="When pasting a full email header block, include the From address.")
+            force_refresh = st.checkbox("Bypass cache (force re-research)", value=False)
+
+        if st.button("Clear caches", use_container_width=True):
+            try:
+                SEARCH_CACHE._d.clear()
+                PROFILE_CACHE._d.clear()
+                st.session_state.pop("result", None)
+                st.success("Caches cleared")
+            except Exception:
+                pass
+
+    # ---- Input area ----
+    st.subheader("1 · Add contacts")
+    st.markdown(
+        "Paste an email header, a list of `Name <email>`, or drop a **screenshot** "
+        "(email, meeting invite, business card, chat). "
+        "On Streamlit ≥ 1.40 you can also press **Ctrl+V** directly in the chat box below."
+    )
+
+    # Text paste
+    raw_text = st.text_area(
+        "Paste text",
+        height=180,
+        placeholder="e.g.\nGanesh R <ganesh.r@ak.com.sa>\nFrom: Jane Doe <jane@acme.com>\nTo: ...",
+        key="raw_text",
+    )
+
+    # Image input — chat_input natively supports clipboard paste on modern Streamlit
+    st.caption("Screenshot: paste with **Ctrl+V** in the box below, or upload a file.")
+    chat_images = []
+    try:
+        chat = st.chat_input("Paste a screenshot here (Ctrl+V)…", accept_file=True,
+                             file_type=["png", "jpg", "jpeg", "webp"], key="img_chat")
+        if chat and getattr(chat, "files", None):
+            chat_images = chat.files
+    except TypeError:
+        # Older Streamlit: no accept_file support
+        st.info("Clipboard image paste needs Streamlit ≥ 1.40. Use the uploader below instead.")
+
+    uploaded = st.file_uploader("…or upload image(s)", type=["png", "jpg", "jpeg", "webp"],
+                                accept_multiple_files=True)
+
+    if chat_images or uploaded:
+        st.image([f for f in (chat_images or uploaded)],
+                 caption=["pasted" if chat_images else "uploaded"] * len(chat_images or uploaded),
+                 width=220)
+
+    context_hint = st.text_input("Company / context hint (optional)",
+                                 placeholder="e.g. Al Abdul Karim, Saudi Arabia")
+
+    # ---- Run ----
+    st.subheader("2 · Research")
+    can_run = S.ready and (bool(raw_text.strip()) or bool(chat_images) or bool(uploaded))
+    if st.button("▶ Start research", type="primary", disabled=not can_run, use_container_width=True):
+        if not S.ready:
+            st.error("Configure API keys in .env first.")
+            return
+        all_contacts: list[Contact] = []
+        seen: set[str] = set()
+
+        # Parse text
+        if raw_text.strip():
+            with st.spinner("Parsing text…"):
+                tc, _ = smart_parse(raw_text, S, context_hint, include_sender)
+                for c in tc:
+                    if c.email not in seen:
+                        seen.add(c.email)
+                        all_contacts.append(c)
+
+        # Parse images
+        for img in (chat_images or uploaded or []):
+            try:
+                data = img.read() if hasattr(img, "read") else img.getvalue()
+            except Exception:
+                data = img.getvalue() if hasattr(img, "getvalue") else b""
+            mime = getattr(img, "type", None) or "image/png"
+            with st.spinner(f"Reading image ({getattr(img, 'name', 'pasted')})…"):
+                ic, _ = contacts_from_image(data, S, mime, include_sender)
+                for c in ic:
+                    if c.email not in seen:
+                        seen.add(c.email)
+                        all_contacts.append(c)
+
+        all_contacts = all_contacts[:S.max_contacts]
+        if not all_contacts:
+            st.warning("No contacts with valid email addresses were found. "
+                       "Names without emails cannot be researched.")
+            return
+
+        st.info(f"Researching **{len(all_contacts)}** contact(s) across "
+                f"**{len({c.domain for c in all_contacts})}** domain(s)…")
+
+        progress = st.progress(0.0, text="Starting…")
+        result = None
+        for event in run_lookup(all_contacts, context_hint, S, force=force_refresh):
+            if event["type"] == "progress":
+                pct = event["done"] / max(event["total"], 1)
+                progress.progress(pct, text=event["message"])
+            elif event["type"] == "result":
+                result = event["data"]
+        progress.empty()
+
+        if result:
+            st.session_state["result"] = result
+            st.success(f"Done in {result['elapsed']}s · engine: {result['engine']}")
+
+    # ---- Results ----
+    result = st.session_state.get("result")
+    if not result:
+        return
+
+    st.subheader("3 · Results")
+    people = result["people"]
+    companies = result["companies"]
+
+    _render_people_table(people)
+
+    with st.expander("Company profiles", expanded=False):
+        if companies:
+            st.dataframe(_build_company_df(companies), use_container_width=True, hide_index=True)
+        else:
+            st.write("No company profiles.")
+
+    if result.get("notes"):
+        with st.expander("Notes & warnings"):
+            for n in result["notes"]:
+                st.write(f"- {n}")
+
+    st.subheader("4 · Export")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button("⬇ CSV", data=to_csv(people, companies),
+                           file_name="contacts.csv", mime="text/csv", use_container_width=True)
+    with c2:
+        try:
+            st.download_button("⬇ Excel", data=to_xlsx(people, companies),
+                               file_name="contacts.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
+        except Exception as e:
+            st.caption(f"Excel unavailable: {e}")
+    with c3:
+        try:
+            st.download_button("⬇ Word", data=to_docx(people, companies, result.get("elapsed", 0)),
+                               file_name="contacts.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               use_container_width=True)
+        except Exception as e:
+            st.caption(f"Word unavailable: {e}")
+
+
+if __name__ == "__main__":
+    main()
