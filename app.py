@@ -105,9 +105,9 @@ class Settings:
         return "Tavily + Azure web search" if self.has_tavily else "Azure web search"
 
 
-def load_settings(get: Callable[[str, str], str]) -> Settings:
+def load_settings() -> Settings:
     def g(k: str, d: str = "") -> str:
-        return str(get(k, d) or d).strip()
+        return str(os.getenv(k, d) or d).strip()
 
     def i(k: str, d: int) -> int:
         try:
@@ -129,20 +129,12 @@ def load_settings(get: Callable[[str, str], str]) -> Settings:
 
 
 def cfg(name: str, default: str = "") -> str:
-    value = os.getenv(name)
-    if value is not None:
-        return str(value).strip()
-    try:
-        if name in st.secrets:
-            return str(st.secrets[name]).strip()
-    except Exception:  # no secrets file present
-        pass
-    return default
+    return os.getenv(name, default).strip()
 
 
 @st.cache_resource(show_spinner=False)
 def get_settings() -> Settings:
-    return load_settings(cfg)
+    return load_settings()
 
 
 S = get_settings()
