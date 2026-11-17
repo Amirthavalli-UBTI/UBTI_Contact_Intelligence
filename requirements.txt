@@ -1,8 +1,7 @@
-streamlit>=1.40
-openai>=1.66
-requests
-pandas
+streamlit>=1.43
+openai>=1.60
 python-dotenv
+requests
 openpyxl
 python-docx
-streamlit-paste-button
+reportlab
