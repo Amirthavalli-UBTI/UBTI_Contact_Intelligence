@@ -1,5 +1,5 @@
-streamlit>=1.43
-openai>=1.60
+streamlit
+openai
 python-dotenv
 requests
 openpyxl
