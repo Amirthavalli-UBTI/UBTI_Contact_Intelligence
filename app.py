@@ -4,16 +4,15 @@ UBTI Contact Intelligence — single-file Streamlit application.
 Everything is in this one file:
   1. Settings + thread-safe TTL cache
   2. Contact parsing (regex, AI vision for images, AI smart-parse for messy text)
-  3. Search backends (Tavily, Apollo, Azure OpenAI web_search)
+  3. Search backends (Tavily, Azure OpenAI web_search)
   4. Research prompts + anti-hallucination normalisation
   5. Parallel research orchestrator
   6. Exports (CSV, Excel, Word, PDF)
   7. Streamlit UI (table view + detail cards + 3 input modes)
 
-Credentials come from Streamlit secrets or environment variables:
+Credentials come from environment variables loaded from .env or Streamlit secrets:
   AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT (default gpt-4.1)
   TAVILY_API_KEY           (required)
-  APOLLO_API_KEY           (optional, improves accuracy)
   APP_PASSWORD             (optional, adds a shared access gate)
 
 Run:  streamlit run app.py
@@ -81,7 +80,6 @@ class Settings:
     azure_key: str = field(default="", repr=False)
     deployment: str = "gpt-4.1"
     tavily_key: str = field(default="", repr=False)
-    apollo_key: str = field(default="", repr=False)
     tavily_depth: str = "basic"
     search_timeout: int = 20          # seconds per Tavily call
     websearch_budget: int = 30        # seconds we are willing to wait for Azure web_search
@@ -123,7 +121,6 @@ def load_settings(get: Callable[[str, str], str]) -> Settings:
         azure_key=g("AZURE_OPENAI_API_KEY"),
         deployment=g("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1"),
         tavily_key=g("TAVILY_API_KEY"),
-        apollo_key=g("APOLLO_API_KEY"),
         tavily_depth=depth if depth in ("basic", "advanced") else "basic",
         websearch_budget=i("WEBSEARCH_BUDGET_SECONDS", 30),
         io_workers=i("IO_WORKERS", 12),
@@ -132,12 +129,15 @@ def load_settings(get: Callable[[str, str], str]) -> Settings:
 
 
 def cfg(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is not None:
+        return str(value).strip()
     try:
         if name in st.secrets:
-            return str(st.secrets[name])
+            return str(st.secrets[name]).strip()
     except Exception:  # no secrets file present
         pass
-    return os.getenv(name, default)
+    return default
 
 
 @st.cache_resource(show_spinner=False)
@@ -446,36 +446,6 @@ def tavily_search(s: Settings, query: str, include_domains: tuple[str, ...] | No
     r.raise_for_status()
     out = [{"title": x.get("title", ""), "url": x.get("url", ""), "content": (x.get("content") or "")[:700]}
            for x in r.json().get("results", []) if x.get("url")]
-    SEARCH_CACHE.set(key, out)
-    return out
-
-
-def apollo_match(s: Settings, email: str) -> dict:
-    key = ("apollo", email)
-    hit = SEARCH_CACHE.get(key)
-    if hit is not None:
-        return hit
-    r = requests.post(
-        "https://api.apollo.io/api/v1/people/match",
-        headers={"x-api-key": s.apollo_key, "Content-Type": "application/json",
-                 "Cache-Control": "no-cache"},
-        params={"email": email, "reveal_personal_emails": "false", "reveal_phone_number": "false"},
-        timeout=s.search_timeout,
-    )
-    if r.status_code != 200:
-        return {}
-    p = r.json().get("person") or {}
-    org = p.get("organization") or {}
-    out = {
-        "name": p.get("name"), "title": p.get("title"), "headline": p.get("headline"),
-        "organization": org.get("name"), "linkedin_url": p.get("linkedin_url"),
-        "city": p.get("city"), "country": p.get("country"),
-        "employment_history": [
-            {"title": e.get("title"), "organization": e.get("organization_name"),
-             "start": e.get("start_date"), "end": e.get("end_date"), "current": e.get("current")}
-            for e in (p.get("employment_history") or [])[:6]
-        ],
-    } if p else {}
     SEARCH_CACHE.set(key, out)
     return out
 
@@ -832,14 +802,8 @@ def _person_job(c: Contact, company_futs: dict[str, Future], s: Settings,
     ws = (io_pool.submit(_safe, azure_web_search, s,
                          SYSTEM_RULES + "\n\n" + PLAYBOOK + "\n\n" + person_task(c, {}, {}))
           if s.has_azure else None)
-    apollo_f = io_pool.submit(_safe, apollo_match, s, c.email) if s.apollo_key else None
 
     ev, _ = _collect(tav, s.search_timeout * 2)
-    if apollo_f is not None:
-        wait([apollo_f], timeout=s.search_timeout)
-        if apollo_f.done() and apollo_f.result()[0]:
-            c = Contact(**{**c.__dict__, "apollo": apollo_f.result()[0]})
-
     companies: dict[str, dict] = {}
     for d, f in company_futs.items():
         try:
@@ -1046,559 +1010,13 @@ def to_docx(people: list[dict], companies: dict[str, dict], elapsed: float = 0) 
 
     for idx, x in enumerate(people, 1):
         p, c = x["profile"], x["contact"]
-        vals = [str(idx), p.get("full_name") or c["name_guess"], p.get("current_title", ""),
-                p.get("department", ""), p.get("ai_relevance", ""), p.get("notes", ""), _best_source(x)]
-        row = table.add_row()
-        for i, v in enumerate(vals):
-            row.cells[i].text = v
-            for r in row.cells[i].paragraphs[0].runs:
-                r.font.size = Pt(9)
-
-    if companies:
-        doc.add_heading("Companies", level=1)
-        co_headers = ["Company", "Domain", "Industry", "HQ", "Size"]
-        co_table = doc.add_table(rows=1, cols=len(co_headers))
-        co_table.style = "Light Grid Accent 1"
-        for i, h in enumerate(co_headers):
-            cell = co_table.rows[0].cells[i]
-            cell.text = h
-            for r in cell.paragraphs[0].runs:
-                r.bold = True
-                r.font.size = Pt(9)
-        for d, co in companies.items():
-            vals = [co.get("company_name", d), d, co.get("industry", ""),
-                    co.get("headquarters", ""), co.get("size", "")]
-            row = co_table.add_row()
-            for i, v in enumerate(vals):
-                row.cells[i].text = v
-                for r in row.cells[i].paragraphs[0].runs:
-                    r.font.size = Pt(9)
-
-    doc.add_paragraph("")
-    footer = doc.add_paragraph("AI-assembled from public web data — verify before relying on it.")
-    footer.runs[0].font.size = Pt(8)
-    footer.runs[0].font.color.rgb = RGBColor(0x94, 0xA3, 0xB8)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-def to_pdf(people: list[dict], companies: dict[str, dict], elapsed: float = 0) -> bytes:
-    from fpdf import FPDF
-
-    def _latin(t: str) -> str:
-        """Replace non-latin-1 chars so built-in Helvetica does not choke."""
-        return (t.replace("—", "-").replace("–", "-").replace("‘", "'").replace("’", "'")
-                 .replace("“", '"').replace("”", '"').replace("…", "..."))
-
-    pdf = FPDF(orientation="L", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.set_text_color(31, 79, 216)
-    pdf.cell(0, 12, _latin("Contact Intelligence Report"), new_x="LMARGIN", new_y="NEXT")
-
-    n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(100, 116, 139)
-    pdf.cell(0, 6, _latin(f"{len(people)} contacts  |  {n_high} high confidence  |  "
-                          f"{len(companies)} companies  |  {elapsed}s research time"),
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(15, 23, 42)
-    pdf.cell(0, 8, "People", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(2)
-
-    headers = ["S.No", "Name", "Title", "Dept", "AI Relevance", "Notes", "Source"]
-    widths = [14, 38, 42, 30, 28, 72, 53]
-
-    pdf.set_font("Helvetica", "B", 7.5)
-    pdf.set_fill_color(234, 240, 255)
-    pdf.set_text_color(31, 79, 216)
-    for h, w in zip(headers, widths):
-        pdf.cell(w, 7, h, border=1, fill=True)
-    pdf.ln()
-
-    pdf.set_font("Helvetica", "", 7)
-    pdf.set_text_color(15, 23, 42)
-    for idx, x in enumerate(people, 1):
-        p, c = x["profile"], x["contact"]
-        src = _best_source(x)
-        src_disp = src.replace("https://", "").replace("http://", "")[:35] if src else ""
-        notes_text = (p.get("notes") or "").replace("\n", " | ")
-        vals = [str(idx),
-                (p.get("full_name") or c["name_guess"])[:24],
-                (p.get("current_title") or "")[:26],
-                (p.get("department") or "")[:18],
-                (p.get("ai_relevance") or "")[:12],
-                notes_text[:48],
-                src_disp]
-        for v, w in zip(vals, widths):
-            pdf.cell(w, 6, _latin(v), border=1)
-        pdf.ln()
-
-    if companies:
-        pdf.ln(5)
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(15, 23, 42)
-        pdf.cell(0, 8, "Companies", new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(2)
-
-        co_h = ["Company", "Domain", "Industry", "HQ", "Size"]
-        co_w = [60, 50, 55, 55, 47]
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.set_fill_color(234, 240, 255)
-        pdf.set_text_color(31, 79, 216)
-        for h, w in zip(co_h, co_w):
-            pdf.cell(w, 7, h, border=1, fill=True)
-        pdf.ln()
-
-        pdf.set_font("Helvetica", "", 7.5)
-        pdf.set_text_color(15, 23, 42)
-        for d, co in companies.items():
-            vals = [(co.get("company_name") or d)[:38], d[:32], (co.get("industry") or "")[:35],
-                    (co.get("headquarters") or "")[:35], (co.get("size") or "")[:28]]
-            for v, w in zip(vals, co_w):
-                pdf.cell(w, 6, _latin(v), border=1)
-            pdf.ln()
-
-    pdf.ln(8)
-    pdf.set_font("Helvetica", "I", 7)
-    pdf.set_text_color(148, 163, 184)
-    pdf.cell(0, 5, _latin("AI-assembled from public web data - verify before relying on it."))
-    return bytes(pdf.output())
-
-
-# ======================================================================================
-# SECTION 8 — Styling
-# ======================================================================================
-
-CSS = """
-<style>
-:root{--ink:#0f172a;--ink2:#334155;--muted:#64748b;--line:#e5e9f0;--bg:#f6f8fb;--card:#fff;
---accent:#1f4fd8;--accent-soft:#eaf0ff;--ok:#0f9d6b;--warn:#b7791f;--bad:#b42318;}
-.stApp,.stApp p,.stApp label,.stApp input,.stApp textarea,.stApp button,.stApp li,.stApp summary,.stApp h1,.stApp h2,.stApp h3{font-family:"Segoe UI",Inter,-apple-system,system-ui,Roboto,"Helvetica Neue",sans-serif;}
-[data-testid="stIconMaterial"],.material-symbols-rounded{font-family:"Material Symbols Rounded"!important;}
-.stApp{background:var(--bg);color:var(--ink);}
-#MainMenu,footer,[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],
-[data-testid="stSidebar"],[data-testid="collapsedControl"],[data-testid="stSidebarCollapsedControl"]{display:none!important;}
-.block-container{max-width:1120px;padding:2.2rem 1.5rem 4rem;}
-
-.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.6rem;}
-.brand{display:flex;align-items:center;gap:.6rem;font-weight:600;letter-spacing:.01em;color:var(--ink);}
-.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#1f4fd8,#5b8cff);display:grid;place-items:center;color:#fff;font-size:13px;}
-.tag{font-size:.74rem;color:var(--muted);border:1px solid var(--line);background:#fff;border-radius:999px;padding:.22rem .7rem;}
-.hero h1{font-size:2.05rem;line-height:1.15;margin:0 0 .35rem;font-weight:650;letter-spacing:-.02em;color:var(--ink);}
-.hero p{margin:0 0 1.4rem;color:var(--muted);font-size:1.02rem;max-width:640px;}
-
-[data-testid="stTabs"] [role="tablist"]{gap:1.1rem;border-bottom:1px solid var(--line);}
-[data-testid="stTabs"] button[role="tab"]{padding:.55rem 1rem;color:var(--muted);font-weight:500;}
-[data-testid="stTabs"] button[aria-selected="true"]{color:var(--accent);}
-[data-testid="stForm"]{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1.3rem 1.4rem;box-shadow:0 1px 2px rgba(15,23,42,.04);}
-[data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea{border-radius:10px;border:1px solid var(--line);background:#fff;}
-[data-testid="stTextInput"] input:focus,[data-testid="stTextArea"] textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
-label p{font-size:.82rem!important;font-weight:550!important;color:var(--ink2)!important;}
-.stButton>button,.stDownloadButton>button,[data-testid="stFormSubmitButton"]>button{border-radius:10px;font-weight:600;padding:.55rem 1.3rem;border:1px solid var(--line);transition:all .15s ease;}
-[data-testid="stFormSubmitButton"]>button[kind="primary"],.stButton>button[kind="primary"]{background:var(--accent);border-color:var(--accent);color:#fff;}
-[data-testid="stFormSubmitButton"]>button[kind="primary"]:hover{background:#1941b3;box-shadow:0 4px 14px rgba(31,79,216,.28);transform:translateY(-1px);}
-[data-testid="stStatusWidget"],[data-testid="stExpander"]{border-radius:12px;border:1px solid var(--line);background:var(--card);}
-[data-testid="stExpander"] summary{font-size:.86rem;color:var(--muted);}
-
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:.8rem;margin:1.6rem 0 1.1rem;}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:.9rem 1.1rem;}
-.kpi b{display:block;font-size:1.55rem;font-weight:650;letter-spacing:-.02em;}
-.kpi span{font-size:.76rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
-.sec{font-size:.78rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:650;margin:1.8rem 0 .8rem;}
-
-.pc{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1.05rem 1.15rem;margin-bottom:.4rem;
-box-shadow:0 1px 2px rgba(15,23,42,.04);transition:box-shadow .18s ease,transform .18s ease,border-color .18s ease;}
-.pc:hover{box-shadow:0 8px 24px rgba(15,23,42,.08);transform:translateY(-1px);border-color:#d3dbe8;}
-.pc-top{display:flex;gap:.8rem;align-items:center;}
-.av{flex:0 0 42px;height:42px;border-radius:12px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-weight:650;font-size:.92rem;}
-.av.co{background:#eef2f7;color:var(--ink2);}
-.pc-id{flex:1;min-width:0;}
-.pc-name{font-weight:650;font-size:1.02rem;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.pc-role{font-size:.88rem;color:var(--ink2);margin-top:.1rem;}
-.pill{font-size:.7rem;font-weight:650;padding:.2rem .6rem;border-radius:999px;white-space:nowrap;}
-.pill.hi{background:#e7f7f0;color:var(--ok);}.pill.md{background:#fff5e0;color:var(--warn);}
-.pill.lo{background:#fdeceb;color:var(--bad);}.pill.nf{background:#eef1f5;color:var(--muted);}
-.meta{display:flex;flex-wrap:wrap;gap:.35rem 1rem;margin-top:.8rem;font-size:.82rem;color:var(--muted);}
-.meta b{color:var(--ink2);font-weight:550;}
-.sum{margin-top:.7rem;font-size:.88rem;color:var(--ink2);line-height:1.5;}
-.links{margin-top:.8rem;display:flex;gap:.5rem;flex-wrap:wrap;}
-.lnk{font-size:.78rem;font-weight:600;color:var(--accent)!important;background:var(--accent-soft);border-radius:8px;padding:.28rem .65rem;text-decoration:none!important;}
-.lnk:hover{filter:brightness(.96);}
-.err{margin-top:.7rem;font-size:.82rem;color:var(--bad);}
-.det h5{font-size:.74rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:.9rem 0 .35rem;}
-.det ul{margin:0;padding-left:1.1rem;color:var(--ink2);font-size:.87rem;line-height:1.55;}
-.det a{color:var(--accent);text-decoration:none;word-break:break-all;}
-.det p{font-size:.86rem;color:var(--ink2);margin:0;line-height:1.5;}
-.note{font-size:.78rem;color:var(--muted);margin-top:.9rem;}
-
-.res-tbl{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.88rem;}
-.res-tbl th{background:var(--accent-soft);color:var(--accent);font-weight:650;text-transform:uppercase;font-size:.72rem;
-letter-spacing:.06em;padding:.65rem .7rem;border-bottom:2px solid var(--accent);text-align:left;}
-.res-tbl td{padding:.6rem .7rem;border-bottom:1px solid var(--line);color:var(--ink2);vertical-align:top;}
-.res-tbl tr:hover td{background:#f8fafd;}
-.res-tbl .sno{width:3.5rem;text-align:center;color:var(--muted);font-weight:600;}
-.res-tbl .name-cell{font-weight:600;color:var(--ink);}
-.res-tbl .notes-cell{font-size:.82rem;line-height:1.45;max-width:280px;}
-.res-tbl .src-cell a{color:var(--accent);text-decoration:none;font-size:.8rem;word-break:break-all;}
-.res-tbl .src-cell a:hover{text-decoration:underline;}
-.ai-pill{font-size:.68rem;font-weight:650;padding:.18rem .5rem;border-radius:999px;white-space:nowrap;display:inline-block;}
-.ai-pill.vh{background:#e0f2fe;color:#0369a1;}.ai-pill.h{background:#e7f7f0;color:var(--ok);}
-.ai-pill.m{background:#fff5e0;color:var(--warn);}.ai-pill.l{background:#eef1f5;color:var(--muted);}
-
-.foot{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:.78rem;color:var(--muted);}
-.gate{max-width:380px;margin:12vh auto 0;}
-.upload-hint{font-size:.82rem;color:var(--muted);margin-top:.3rem;}
-.export-row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;}
-@media(max-width:820px){.kpis{grid-template-columns:repeat(2,1fr);}.hero h1{font-size:1.6rem;}}
-</style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
-
-
-# ======================================================================================
-# SECTION 9 — UI render helpers
-# ======================================================================================
-
-def safe_href(u: str) -> str:
-    return esc(u, quote=True) if u.startswith(("http://", "https://")) else ""
-
-
-def initials(name: str) -> str:
-    parts = [p for p in name.replace(".", " ").split() if p]
-    return (parts[0][0] + (parts[-1][0] if len(parts) > 1 else "")).upper() if parts else "?"
-
-
-def host(u: str) -> str:
-    return (urlparse(u).netloc or u).removeprefix("www.")
-
-
-CONF = {"high": ("hi", "High confidence"), "medium": ("md", "Medium"),
-        "low": ("lo", "Low"), "not_found": ("nf", "Not found")}
-
-
-def _ai_pill(level: str) -> str:
-    cls = {"Very High": "vh", "High": "h", "Medium": "m", "Low": "l"}.get(level, "m")
-    return f'<span class="ai-pill {cls}">{esc(level)}</span>' if level else ""
-
-
-def people_table(people: list[dict]) -> str:
-    """S.No | Name | Title | Department | AI Relevance / Interest | Notes | Source"""
-    h = ('<table class="res-tbl"><thead><tr>'
-         '<th class="sno">S.No</th><th>Name</th><th>Title</th><th>Department</th>'
-         '<th>AI Relevance / Interest</th><th>Notes</th><th>Source</th>'
-         '</tr></thead><tbody>')
-    for idx, item in enumerate(people, 1):
-        p, c = item["profile"], item["contact"]
-        name = p.get("full_name") or c["name_guess"]
-        notes = esc(p.get("notes") or "").replace("\n", "<br>")
-        src = _best_source(item)
-        src_html = (f'<a href="{safe_href(src)}" target="_blank" rel="noopener noreferrer">'
-                    f'{esc(host(src))}</a>') if safe_href(src) else ""
-        h += (f'<tr><td class="sno">{idx}</td>'
-              f'<td class="name-cell">{esc(name)}</td>'
-              f'<td>{esc(p.get("current_title") or "")}</td>'
-              f'<td>{esc(p.get("department") or "")}</td>'
-              f'<td>{_ai_pill(p.get("ai_relevance") or "")}</td>'
-              f'<td class="notes-cell">{notes}</td>'
-              f'<td class="src-cell">{src_html}</td></tr>')
-    return h + "</tbody></table>"
-
-
-def person_card(item: dict) -> str:
-    c, p = item["contact"], item["profile"]
-    name = p.get("full_name") or c["name_guess"]
-    role = " · ".join(x for x in (p.get("current_title"), p.get("current_company")) if x) or "Role not found"
-    cls, label = CONF.get(p.get("confidence", "not_found"), CONF["not_found"])
-    meta = f'<span><b>Email</b> {esc(c["email"])}</span>'
-    if p.get("location"):
-        meta += f'<span><b>Location</b> {esc(p["location"])}</span>'
-    links = ""
-    if safe_href(p.get("linkedin_url", "")):
-        links = (f'<div class="links"><a class="lnk" href="{safe_href(p["linkedin_url"])}" '
-                 f'target="_blank" rel="noopener noreferrer">LinkedIn ↗</a></div>')
-    summary = f'<div class="sum">{esc(p["summary"])}</div>' if p.get("summary") else ""
-    err = f'<div class="err">{esc(p["_error"])}</div>' if p.get("_error") else ""
-    return (f'<div class="pc"><div class="pc-top"><div class="av">{esc(initials(name))}</div>'
-            f'<div class="pc-id"><div class="pc-name">{esc(name)}</div><div class="pc-role">{esc(role)}</div></div>'
-            f'<span class="pill {cls}">{label}</span></div>'
-            f'<div class="meta">{meta}</div>{summary}{links}{err}</div>')
-
-
-def person_details(item: dict) -> str:
-    p = item["profile"]
-    h = '<div class="det">'
-    if p.get("previous_roles"):
-        h += "<h5>Previous roles</h5><ul>" + "".join(
-            f'<li>{esc(r.get("title", ""))}{" — " + esc(r["company"]) if r.get("company") else ""}'
-            f'{" (" + esc(r["period"]) + ")" if r.get("period") else ""}</li>'
-            for r in p["previous_roles"]) + "</ul>"
-    if p.get("match_reasoning"):
-        h += f'<h5>Why this match</h5><p>{esc(p["match_reasoning"])}</p>'
-    if p.get("sources"):
-        h += "<h5>Sources</h5><ul>" + "".join(
-            f'<li><a href="{safe_href(u)}" target="_blank" rel="noopener noreferrer">{esc(host(u))}</a></li>'
-            for u in p["sources"] if safe_href(u)) + "</ul>"
-    if item["contact"].get("used_apollo"):
-        h += '<div class="note">Verified against Apollo structured data.</div>'
-    return h + "</div>" if len(h) > 22 else '<div class="det"><p>No additional details found.</p></div>'
-
-
-def company_card(d: str, co: dict) -> str:
-    name = co.get("company_name") or d
-    meta = "".join(f"<span><b>{k}</b> {esc(co[f])}</span>" for k, f in
-                   (("HQ", "headquarters"), ("Industry", "industry"), ("Size", "size")) if co.get(f))
-    desc = f'<div class="sum">{esc(co["what_they_do"])}</div>' if co.get("what_they_do") else ""
-    grp = (f'<div class="meta"><span><b>Group</b> {esc(co["parent_or_group"])}</span></div>'
-           if co.get("parent_or_group") else "")
-    err = f'<div class="err">{esc(co["_error"])}</div>' if co.get("_error") else ""
-    return (f'<div class="pc"><div class="pc-top"><div class="av co">{esc(initials(name))}</div>'
-            f'<div class="pc-id"><div class="pc-name">{esc(name)}</div><div class="pc-role">{esc(d)}</div></div></div>'
-            f'<div class="meta">{meta}</div>{grp}{desc}{err}</div>')
-
-
-def company_details(co: dict) -> str:
-    h = '<div class="det">'
-    if co.get("products"):
-        h += "<h5>Products &amp; services</h5><p>" + esc(", ".join(co["products"])) + "</p>"
-    if co.get("other_offices"):
-        h += "<h5>Other offices</h5><p>" + esc(", ".join(co["other_offices"])) + "</p>"
-    if co.get("key_leadership"):
-        h += "<h5>Leadership</h5><ul>" + "".join(
-            f'<li>{esc(x["name"])}{" — " + esc(x["title"]) if x.get("title") else ""}</li>'
-            for x in co["key_leadership"]) + "</ul>"
-    if co.get("sources"):
-        h += "<h5>Sources</h5><ul>" + "".join(
-            f'<li><a href="{safe_href(u)}" target="_blank" rel="noopener noreferrer">{esc(host(u))}</a></li>'
-            for u in co["sources"] if safe_href(u)) + "</ul>"
-    return h + "</div>" if len(h) > 22 else '<div class="det"><p>No additional details found.</p></div>'
-
-
-# ======================================================================================
-# SECTION 10 — Access gate (optional: set APP_PASSWORD)
-# ======================================================================================
-
-APP_PASSWORD = cfg("APP_PASSWORD")
-if APP_PASSWORD and not st.session_state.get("authed"):
-    st.markdown('<div class="gate"><div class="brand"><div class="logo">◆</div>UBTI Contact Intelligence</div>'
-                '<p style="color:#64748b;margin:.8rem 0 0">Enter your access code to continue.</p></div>',
-                unsafe_allow_html=True)
-    _, mid, _ = st.columns([1, 1.1, 1])
-    with mid, st.form("gate"):
-        code = st.text_input("Access code", type="password")
-        if st.form_submit_button("Continue", type="primary"):
-            if hmac.compare_digest(code.encode(), APP_PASSWORD.encode()):
-                st.session_state["authed"] = True
-                st.rerun()
-            st.error("Incorrect access code.")
-    st.stop()
-
-
-# ======================================================================================
-# SECTION 11 — Header + inputs
-# ======================================================================================
-
-st.markdown(
-    '<div class="topbar"><div class="brand"><div class="logo">◆</div>UBTI Contact Intelligence</div>'
-    '<div class="tag">Public-web research · sources included</div></div>'
-    '<div class="hero"><h1>Know who you are talking to.</h1>'
-    '<p>Enter a name and email, paste an Outlook header, drop a screenshot of a meeting invite, '
-    'or just paste messy text — we will figure it out.</p></div>',
-    unsafe_allow_html=True,
-)
-
-if not S.ready:
-    st.error("This service is not configured yet. Please contact your administrator.")
-    st.stop()
-
-
-def execute(contacts: list[Contact], hint: str, force: bool) -> None:
-    if not contacts:
-        st.warning("No valid email address found. Please check the input.")
-        return
-    if len(contacts) > S.max_contacts:
-        st.info(f"Processing the first {S.max_contacts} of {len(contacts)} contacts.")
-        contacts = contacts[: S.max_contacts]
-    final = None
-    with st.status("Researching…", expanded=True) as status:
-        bar = st.progress(0.0)
-        for ev in run_lookup(contacts, hint, S, force):
-            if ev["type"] == "progress":
-                frac = ev["done"] / ev["total"] if ev["total"] else 0.0
-                bar.progress(min(frac, 1.0))
-                status.update(label=f"Researching · {ev['done']} of {ev['total']} complete")
-                st.write(ev["message"])
-            else:
-                final = ev["data"]
-        status.update(label=f"Completed in {final['elapsed']}s", state="complete", expanded=False)
-    st.session_state["results"] = final
-
-
-tab_one, tab_bulk, tab_image = st.tabs(["Single lookup", "Bulk · Outlook paste", "Screenshot / Image"])
-
-with tab_one:
-    with st.form("single", border=True):
-        c1, c2 = st.columns(2)
-        in_name = c1.text_input("Full name", placeholder="Paul Raj")
-        in_email = c2.text_input("Office email", placeholder="paulr@company.com")
-        in_ctx = st.text_input("Company or context (optional)", placeholder="e.g. Ducont — Dubai IT services")
-        f1, f2 = st.columns([3, 1.2])
-        fresh1 = f1.checkbox("Ignore saved results (fresh search)", key="fresh1")
-        go_one = f2.form_submit_button("Find contact", type="primary", use_container_width=True)
-    if go_one:
-        m = EMAIL_RE.fullmatch(in_email.strip().strip("<>"))
-        if not m:
-            st.warning("Please enter a valid office email address.")
-        else:
-            em = m.group(0).lower()
-            local, dom = em.split("@", 1)
-            nm = " ".join(in_name.split())
-            execute([Contact(email=em, display_name=nm, local=local, domain=dom,
-                             name_guess=nm or guess_name_from_local(local),
-                             company_hint=in_ctx.strip())],
-                    in_ctx.strip(), fresh1)
-
-with tab_bulk:
-    with st.form("bulk", border=True):
-        raw = st.text_area("Emails, Outlook header, or any text with contacts", height=150,
-                           placeholder="Paste anything — a To/Cc line, a meeting invite, names and emails in any "
-                                       "format, or even a messy copy-paste. We'll extract the contacts.")
-        in_ctx2 = st.text_input("Company or context (optional)", key="ctx2")
-        b1, b2, b3 = st.columns([1.6, 1.8, 1.2])
-        inc_sender = b1.checkbox("Include sender (From)")
-        fresh2 = b2.checkbox("Ignore saved results", key="fresh2")
-        go_bulk = b3.form_submit_button("Find contacts", type="primary", use_container_width=True)
-    if go_bulk:
-        contacts = parse_contacts(raw, in_ctx2, include_sender=inc_sender)   # fast regex pass
-        all_emails = {e.lower() for e in EMAIL_RE.findall(raw or "")}
-        found_emails = {c.email for c in contacts}
-        missed = all_emails - found_emails
-        hint_bulk = in_ctx2.strip()
-
-        if not contacts or missed:       # fall back to the LLM smart parser
-            with st.spinner("Extracting contacts from unstructured text…"):
-                try:
-                    smart_contacts, llm_hint = smart_parse(raw, S, in_ctx2, include_sender=inc_sender)
-                except Exception:
-                    smart_contacts, llm_hint = [], ""
-            added = 0
-            for sc in smart_contacts:
-                if sc.email not in found_emails:
-                    contacts.append(sc)
-                    found_emails.add(sc.email)
-                    added += 1
-            hint_bulk = hint_bulk or (llm_hint or "").strip()
-            if added:
-                st.success(f"AI extracted {added} additional contact(s) from the text.")
-        execute(contacts, hint_bulk, fresh2)
-
-with tab_image:
-    uploaded = st.file_uploader(
-        "Upload a screenshot or image",
-        type=["png", "jpg", "jpeg", "gif", "bmp", "webp"],
-        help="Screenshot of an email, meeting invite, business card, or any image with contact information.",
-    )
-    st.markdown('<p class="upload-hint">Supported: email screenshots, meeting invites, business cards, '
-                'chat screenshots — any image with names and email addresses.</p>', unsafe_allow_html=True)
-    img_ctx = st.text_input("Company or context (optional)", key="ctx_img")
-    ic1, ic2, ic3 = st.columns([1.6, 1.8, 1.2])
-    img_sender = ic1.checkbox("Include sender (From)", key="img_sender", value=True)
-    img_fresh = ic2.checkbox("Ignore saved results", key="fresh_img")
-    go_img = ic3.button("Extract & find contacts", type="primary", use_container_width=True)
-
-    if go_img:
-        if not uploaded:
-            st.warning("Please upload an image first.")
-        else:
-            image_bytes = uploaded.read()
-            mime_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                        "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp"}
-            ext = (uploaded.name or "image.png").rsplit(".", 1)[-1].lower()
-            mime = mime_map.get(ext, "image/png")
-
-            with st.spinner("Reading image with AI vision…"):
-                try:
-                    contacts, hint = contacts_from_image(image_bytes, S, mime, include_sender=img_sender)
-                except Exception as e:
-                    st.error(f"Could not read the image. Please try a clearer screenshot. ({type(e).__name__})")
-                    contacts, hint = [], img_ctx
-
-            if contacts:
-                st.success(f"Extracted {len(contacts)} contacts from the image.")
-                execute(contacts, (hint or img_ctx).strip(), img_fresh)
-            else:
-                st.warning("No email addresses could be extracted from this image. "
-                           "Try a clearer screenshot or use the Bulk tab to paste the text manually.")
-
-
-# ======================================================================================
-# SECTION 12 — Results
-# ======================================================================================
-
-res = st.session_state.get("results")
-if res:
-    people, companies = res["people"], res["companies"]
-    n_high = sum(1 for x in people if x["profile"].get("confidence") == "high")
-    st.markdown(
-        '<div class="kpis">'
-        f'<div class="kpi"><b>{len(people)}</b><span>Contacts</span></div>'
-        f'<div class="kpi"><b>{n_high}</b><span>High confidence</span></div>'
-        f'<div class="kpi"><b>{len(companies)}</b><span>Companies</span></div>'
-        f'<div class="kpi"><b>{res["elapsed"]}s</b><span>Research time</span></div></div>',
-        unsafe_allow_html=True)
-
-    st.markdown('<div class="sec">People</div>', unsafe_allow_html=True)
-    st.markdown(people_table(people), unsafe_allow_html=True)
-
-    for i in range(0, len(people), 2):          # expandable detail cards below the table
-        cols = st.columns(2, gap="medium")
-        for col, item in zip(cols, people[i:i + 2]):
-            with col:
-                p, c = item["profile"], item["contact"]
-                nm = p.get("full_name") or c["name_guess"]
-                with st.expander(f"🔍 {nm} — details & sources"):
-                    st.markdown(person_card(item), unsafe_allow_html=True)
-                    st.markdown(person_details(item), unsafe_allow_html=True)
-
-    if companies:
-        st.markdown('<div class="sec">Companies</div>', unsafe_allow_html=True)
-        items = list(companies.items())
-        for i in range(0, len(items), 2):
-            cols = st.columns(2, gap="medium")
-            for col, (d, co) in zip(cols, items[i:i + 2]):
-                with col:
-                    st.markdown(company_card(d, co), unsafe_allow_html=True)
-                    with st.expander("Details & sources"):
-                        st.markdown(company_details(co), unsafe_allow_html=True)
-
-    st.markdown('<div class="sec">Export results</div>', unsafe_allow_html=True)
-    ex1, ex2, ex3, ex4, ex5, _ = st.columns([1.1, 1.1, 1.1, 1.1, 1.1, 3])
-    elapsed = res.get("elapsed", 0)
-
-    ex1.download_button("📄 CSV", to_csv(people, companies), "contacts.csv", "text/csv",
-                        use_container_width=True)
-    ex2.download_button("📊 Excel", to_xlsx(people, companies), "contacts.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True)
-    ex3.download_button("📝 Word", to_docx(people, companies, elapsed), "contacts.docx",
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True)
-    ex4.download_button("📕 PDF", to_pdf(people, companies, elapsed), "contacts.pdf",
-                        "application/pdf", use_container_width=True)
-
-    if ex5.button("Clear results", use_container_width=True):
-        st.session_state.pop("results", None)
-        st.rerun()
-
-    if res.get("notes"):
-        st.markdown(f'<div class="note">{esc(" ".join(res["notes"]))}</div>', unsafe_allow_html=True)
-
-st.markdown('<div class="foot">AI-assembled from public web data — verify before relying on it. '
-            'Use for legitimate B2B purposes only.</div>', unsafe_allow_html=True)
+        rows.append({
+            "S.No": idx,
+            "Name": p.get("full_name") or c["name_guess"],
+            "Title": p.get("current_title", ""),
+            "Department": p.get("department", ""),
+            "AI Relevance / Interest": p.get("ai_relevance", ""),
+            "Notes": p.get("notes", ""),
+            "Source": _best_source(x),
+        })
+    return pd.DataFrame(rows)
